@@ -1,0 +1,24 @@
+# Hashcat potfiles and sessions
+*.pot
+hashcat.pot
+*.pid
+
+# ESSID/PMKID files
+*.22000
+
+# Sensitive results
+results/*.json
+results/*.txt
+loot.txt
+
+# Logs
+logs/*.log
+
+# XDG data directories
+xdg/
+
+# Capture files
+captures/*.cap
+captures/*.csv
+captures/*.netxml
+captures/*.log.csv
